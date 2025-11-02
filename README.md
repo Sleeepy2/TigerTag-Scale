@@ -18,6 +18,7 @@
 - [Performance](#-performance)
 - [Development](#-development)
 - [Troubleshooting](#-troubleshooting)
+- [Changelog](#-changelog)
 - [Contributing](#-contributing)
 - [License](#-license)
 
@@ -46,6 +47,8 @@
 - **mDNS support** — access via `http://tigerscale.local`
 - **OTA-ready** — separate firmware/data partitions
 - **Auto-push to cloud** — stable weight detection algorithm
+- **Non-blocking OLED UI** — removed transient `displayMessage()` + `delay()`; single state-driven renderer
+- **Refined UX flow** — skips intermediate “Net ... / ✓ Synced!” screen and jumps directly to **IDLE with net weight** in large font
 
 ---
 
@@ -205,6 +208,7 @@ pio device monitor
   - WiFi reconfiguration
   - Factory reset
   - API key update
+- **Sending screen** simplified — shows `Sending…` + short UID (no countdown) for cleaner transitions
 
 ### Performance Metrics
 
@@ -265,6 +269,8 @@ Send weight to TigerTag cloud.
   "status": "ok"
 }
 ```
+
+**Device UX after success:** The scale immediately switches to **IDLE** and displays the **net spool weight** in large text (the intermediate “Net … / ✓ Synced!” screen is skipped).
 
 #### `POST /api/tare`
 Reset scale to zero.
@@ -409,6 +415,9 @@ pio run --target size
 
 # Update libraries
 pio pkg update
+
+# Full cycle (filesystem → firmware → monitor)
+pio run -t uploadfs && pio run -t upload && pio device monitor
 ```
 
 ---
@@ -423,6 +432,18 @@ pio pkg update
 | **Files not compressed** | Check `data/www/*.gz` exists |
 | **No WebSocket connection** | Verify ESP32 IP, check firewall |
 | **Stale cache** | Hard reload (Ctrl+Shift+R) |
+| **Flicker to “Ready to weigh” between UID and Sending** | Fixed: state machine forces `SENDING` during countdown and prevents rollback |
+---
+
+## 🗓️ Changelog
+
+### 2025-11-02
+- OLED state machine cleaned up: removed blocking `delay()` calls and transient `displayMessage()` in critical flows
+- Success path now skips the transient “Net … / ✓ Synced!” page and goes straight to **IDLE** with **net weight** (big)
+- Idle screen with net weight now shows two helper lines: `remaining` and `Remove filament` (with improved vertical spacing)
+- Prevented brief rollback to `Ready to weigh` before `Sending…` (forced `SENDING` state during countdown)
+- `Sending…` screen simplified (removed `2s/1s` countdown), displays short UID only
+- Minor layout polish on OLED (spacing and cursor positions)
 
 ### Hardware
 

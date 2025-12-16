@@ -56,20 +56,6 @@ void onWiFiEvent(WiFiEvent_t event);
 String gSetupSsid;     // e.g. Setup-TigerScale-AB12
 String gMdnsName;      // e.g. tigerscale-AB12
 
-// ============================================================================
-// FONCTION D'ARRONDI CENTRALISÉE
-// ============================================================================
-
-/**
- * 🔎 Arrondit un poids float à un entier
- * Utilise l'arrondi arithmétique standard
- * Positif: 50.2→50, 50.5→51, 50.9→51
- * Négatif: -1.2→-1, -1.5→-2, -1.9→-2
- */
-static inline int roundWeight(float weight) {
-    return (int)(weight + (weight >= 0 ? 0.5f : -0.5f));
-}
-
 static String macSuffix4() {
     uint8_t mac[6];
     WiFi.macAddress(mac); // MAC[0]..MAC[5]
@@ -103,6 +89,13 @@ bool apiValid = false;          // last known validation state
 uint32_t lastApiBroadcastMs = 0; // WS broadcast throttle for apiStatus
 float calibrationFactor = 406;
 float currentWeight = 0.0;
+// --- Hold mode variables ---
+bool holdMode = false;
+float holdWeight = 0.0f;
+uint32_t holdStartMs = 0;
+const float HOLD_THRESHOLD_ENTER = 0.5f;
+const float HOLD_THRESHOLD_EXIT = 1.5f;
+const uint32_t HOLD_TIME_MS = 700;
 String lastUID = "";       // decimal UID for API/UI
 String lastUIDHex = "";    // hex UID for logs/debug
 
@@ -126,55 +119,17 @@ uint32_t stableSinceMs = 0;
 float stableCandidate = NAN;
 uint32_t lastPushMs = 0;
 
-// ============================================================================
-// 🔄 FONCTIONS DE FILTRE DE POIDS - VERSION COMPLÈTE OPTIMISÉE
-// ============================================================================
-// 🔎 Configuration de stabilité (à ajuster selon capteur/feedback)
-const float EMA_ALPHA_FINE      = 0.05f;   // Très lent (5% adaptatif)
-const float EMA_ALPHA_FAST      = 0.12f;   // Adaptif lors de changement rapide
-const int   MEDIAN_WINDOW_LARGE = 15;      // 15 lectures (plus robustesse)
-const float HYSTERESIS_THRESHOLD = 0.5f;   // Hystérésis: 0.5g (évite scintillement)
-const float DEAD_ZONE_G         = 1.0f;   // Zone morte: ignore bruits < 1.0g
-const uint32_t STABLE_DISPLAY_MS = 1500;    // N'affiche que si stable 800ms
-const float MIN_WEIGHT_CHANGE_TO_RESET_G = 50.0f;  // Seuil de retrait de bobine (grammes)
-static float gLastCloudWeight = NAN;               // Poids net du cloud sauvegardé
-static float gLastSentWeight = NAN;                // Poids BRUT envoyé au cloud (avec spool)
-static uint32_t gCloudWeightSetMs = 0;             // Timestamp quand le poids cloud a été reçu
-
-// 🔎 État interne du filtre
-static float gEmaWeight         = 0.0f;
-static bool  gEmaInit           = false;
-static float gMedianBuf[MEDIAN_WINDOW_LARGE] = {0};
-static int   gMedianIdx         = 0;
-static int   gMedianCount       = 0;
-static float gLastDisplayedWeight = 0.0f;
-static uint32_t gStableStartMs  = 0;
-static bool  gIsStable          = false;
-
-// --- Cloud sync result cache (server-computed net weight_available) ---
-static bool  gLastNetValid   = false;
-static float gLastNetWeight  = NAN;   // server weight_available
-static float gLastRawWeight  = NAN;   // server weight (raw, includes container)
-static float gLastContainer  = 0.0f;  // server container_weight
+// --- Filters state (median + EMA) ---
+static float gEmaWeight = 0.0f;
+static bool  gEmaInit   = false;
+static float gMedianBuf[MEDIAN_WINDOW] = {0};
+static int   gMedianIdx = 0;
+static int   gMedianCount = 0; // <= MEDIAN_WINDOW
 
 // --- UI/Status for auto-send countdown & phase ---
 volatile int sendCountdown = -1;         // -1 = no countdown, >=0 = seconds remaining
 String sendPhase = "";                  // "" | "countdown" | "send" | "success" | "error"
 uint32_t sendPhaseLastChangeMs = 0;      // for expiring transient phases (success/error)
-
-enum OledState {
-    OLED_STATE_IDLE,           // Au repos
-    OLED_STATE_WEIGHING,       // Pesage en cours
-    OLED_STATE_UID_DETECTED,   // UID détecté
-    OLED_STATE_SENDING,        // Envoi au cloud
-    OLED_STATE_SUCCESS,        // Succès
-    OLED_STATE_ERROR           // Erreur
-};
-
-OledState currentOledState = OLED_STATE_IDLE;
-uint32_t oledStateChangeMs = 0;
-const uint32_t OLED_MESSAGE_DURATION_MS = 2000;  // 2 secondes pour lire
-const uint32_t OLED_ERROR_DURATION_MS = 3000;    // 3 secondes pour erreur
 
 // ============================================================================
 // AFFICHAGE OLED
@@ -208,81 +163,9 @@ void displayMessage(String line1, String line2 = "", String line3 = "", String l
     display.display();
 }
 
-// New state-aware renderer
-void displayWeightWithState(float weight, const String& uid, OledState state) {
-    display.clearDisplay();
-    
-    // En-tête avec titre et statut WiFi
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("Tiger-Scale");
-    display.setCursor(100, 0);
-    display.println(wifiConnected ? "WiFi" : "----");
-    
-    // Poids au centre (grande taille)
-    // Affiche le poids NET (cloud) en grand lorsque l'état est IDLE avec un net présent
-    float bigVal = weight;
-    if (state == OLED_STATE_IDLE && !isnan(gLastCloudWeight)) {
-        bigVal = gLastCloudWeight;  // montrer le net à la place du poids balance
-    }
-    int wInt = roundWeight(bigVal);
-    display.setTextSize(2);
-    display.setCursor(0, 20);
-    display.print(wInt);
-    display.println("g");
-    
-    // État en bas selon l'état actuel
-    display.setTextSize(1);
-    display.setCursor(0, 50);
-    
-    switch (state) {
-        case OLED_STATE_IDLE:
-            if (!isnan(gLastCloudWeight)) {
-                // Poids net déjà affiché en grand ; on évite d'afficher le poids balance
-                display.setCursor(0, 41);  // move slightly up to add spacing
-                display.println("Remaining");
-                display.setCursor(0, 56);
-                display.println("Remove Filament");
-            } else {
-                display.println("Ready to weigh");
-            }
-            break;
-            
-        case OLED_STATE_WEIGHING:
-            display.println("Weighing...");
-            break;
-            
-        case OLED_STATE_UID_DETECTED:
-            display.print("UID: ");
-            display.println(uid.substring(0, 16));
-            // display.setCursor(0, 56);
-            // display.println("Ready to push");
-            break;
-            
-        case OLED_STATE_SENDING:
-            // display.println("Sending...");
-            display.setCursor(0, 56);
-            display.print("UID: ");
-            display.println(uid.substring(0, 16));
-            break;
-            
-        case OLED_STATE_SUCCESS:
-            display.print("Net: ");
-            display.println(String(roundWeight(gLastNetWeight)) + " g");
-            display.setCursor(0, 56);
-            display.println("✓ Synced!");
-            break;
-            
-        case OLED_STATE_ERROR:
-            display.println("✗ Error!");
-            display.setCursor(0, 56);
-            display.println("Check WiFi/API");
-            break;
-    }
-    
-    display.display();
-}
-
+// 🔎 OLED Display: Shows the current weight and RFID UID, plus WiFi status, on the OLED.
+//    This function is called frequently to update the main UI shown to the user.
+void displayWeight(float weight, const String& uid = "");
 
 bool checkServerHealth();
 bool pushWeightToCloud(float w);
@@ -290,31 +173,48 @@ void handleAutoPush(float w);
 bool validateApiKeyFirmware(const String& key, String& displayNameOut);
 bool deleteApiKey();
 
-// Parse Cloud Function JSON response to extract weight_available (net), weight (raw) and container_weight
-static bool parseCloudNetWeights(const String& resp, float& netOut, float& rawOut, float& containerOut) {
-    StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, resp);
-    if (err) {
-        Serial.printf("[CloudParse] JSON error: %s\n", err.c_str());
-        return false;
+// 🔎 OLED Display: Main function for rendering weight and tag info on the OLED.
+//    Shows WiFi status, weight (large digits), UID, and device IP.
+void displayWeight(float weight, const String& uid) {
+    display.clearDisplay();
+    
+     // En-tête avec titre et statut WiFi
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Tiger-Scale");
+    
+    display.setTextSize(1);
+    display.setCursor(100, 0);
+    display.println(wifiConnected ? "WiFi" : "----");
+
+    // Hold mode indicator (🅗 at x=112, y=0)
+    if (holdMode) { display.setCursor(112, 0); display.print("🅗"); }
+    
+    // Poids au centre (grande taille) — entier uniquement
+    int wInt = (int)(weight + (weight >= 0 ? 0.5f : -0.5f));
+    display.setTextSize(2);
+    display.setCursor(0, 20);
+    display.print(wInt);
+    display.println(" g");
+    
+    // UID
+    if (uid.length() > 0) {
+        display.setTextSize(1);
+        display.setCursor(0, 45);
+        display.print("UID:");
+        display.println(uid);
     }
-    bool success = doc["success"] | false;
-    if (!success) {
-        Serial.println("[CloudParse] success=false");
-        return false;
+    
+    // IP en dessous de l'UID
+    display.setTextSize(1);
+    display.setCursor(0, 56);
+    if (wifiConnected) {
+        display.print("IP: ");
+        display.println(WiFi.localIP().toString().c_str());
     }
-    // Extract values
-    if (doc.containsKey("weight_available")) {
-        netOut = doc["weight_available"].as<float>();
-        rawOut = doc["weight"]            | NAN;
-        containerOut = doc["container_weight"] | 0.0f;
-        return true;
-    }
-    Serial.println("[CloudParse] missing weight_available");
-    return false;
+    
+    display.display();
 }
-
-
 
 // ============================================================================
 // PORTAIL CAPTIF & CONFIGURATION
@@ -536,7 +436,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             if (newKey.length() == 0) {
                 displayMessage("API key FAIL", "Check key");
                 delay(600);
-                displayWeightWithState(currentWeight, lastUID, currentOledState);
+                displayWeight(currentWeight, lastUID);
                 client->text("{\"type\":\"apiStatus\",\"valid\":false}");
                 return;
             }
@@ -554,7 +454,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                 // Notify UI
                 displayMessage("API key OK", apiDisplayName);
                 delay(600);
-                displayWeightWithState(currentWeight, lastUID, currentOledState);
+                displayWeight(currentWeight, lastUID);
                 StaticJsonDocument<192> out;
                 out["type"] = "apiStatus";
                 out["valid"] = true;
@@ -566,7 +466,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             } else {
                 displayMessage("API key FAIL", "Check key");
                 delay(600);
-                displayWeightWithState(currentWeight, lastUID, currentOledState);
+                displayWeight(currentWeight, lastUID);
                 client->text("{\"type\":\"apiStatus\",\"valid\":false}");
             }
         }
@@ -574,7 +474,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             bool ok = deleteApiKey();
             displayMessage(ok ? "API key deleted" : "Delete failed", ok ? "Credentials cleared" : "Check storage");
             delay(600);
-            displayWeightWithState(currentWeight, lastUID, currentOledState);
+            displayWeight(currentWeight, lastUID);
             // Inform only the requester about the result
             {
                 StaticJsonDocument<96> out;
@@ -595,24 +495,9 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     }
 }
 
-void resetWeightFilters() {
-    gEmaWeight = 0.0f;
-    gEmaInit = false;
-    gMedianIdx = 0;
-    gMedianCount = 0;
-    gLastDisplayedWeight = 0.0f;
-    gStableStartMs = 0;
-    gIsStable = false;
-    memset(gMedianBuf, 0, sizeof(gMedianBuf));
-    Serial.println("[FILTER] ✅ Weight filters reset - fresh start!");
-}
-
-
 // ============================================
 // SERVEUR WEB & API
 // ============================================
-
-
 void setupWebServer() {
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
@@ -687,7 +572,8 @@ void setupWebServer() {
     // Static mapping for images (explicit, cache-safe during dev)
     // 🔎 Routing: Serve static image assets from /www/img.
     //    Cache disabled (no-store) for development; can be set to long-term cache in production.
-    server.serveStatic("/img", LittleFS, "/www/img").setCacheControl("no-store");
+    server.serveStatic("/img", LittleFS, "/www/img")
+          .setCacheControl("no-store");
     
     server.on("/api/config", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
         [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
@@ -724,11 +610,15 @@ void setupWebServer() {
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
         String json = "{";
         {
-            int wInt = roundWeight(currentWeight);
+            int wInt = (int)(currentWeight + (currentWeight >= 0 ? 0.5f : -0.5f));
             json += "\"weight\":" + String(wInt) + ",";
             // Insert rawWeight and smoothWeight after weight
             json += "\"rawWeight\":" + String(currentWeight, 2) + ",";
+            json += "\"smoothWeight\":" + String((int)(currentWeight + (currentWeight >= 0 ? 0.5f : -0.5f))) + ",";
         }
+        // Hold mode info
+        json += "\"hold\":" + String(holdMode ? "true" : "false") + ",";
+        json += "\"holdWeight\":" + String((int)(holdWeight + (holdWeight>=0?0.5f:-0.5f))) + ",";
         json += "\"uid\":\"" + lastUID + "\",";
         json += "\"uid_hex\":\"" + lastUIDHex + "\",";
         json += "\"wifi\":\"" + WiFi.SSID() + "\",";
@@ -881,7 +771,7 @@ void setupWebServer() {
             while (num.length() && (num[num.length()-1] < '0' || num[num.length()-1] > '9') && num[num.length()-1] != '.') num.remove(num.length()-1);
             while (num.length() && ((num[0] < '0' || num[0] > '9') && num[0] != '-' && num[0] != '.')) num.remove(0,1);
             float w = num.toFloat();
-            int wi = roundWeight(w);
+            int wi = (int)(w + (w >= 0 ? 0.5f : -0.5f));
             if (w <= 0 && num.indexOf('0') != 0 && num.indexOf('.') != 0) { request->send(400, "application/json", "{\"error\":\"invalid weight\"}"); return; }
 
             // optional uid override
@@ -908,31 +798,14 @@ void setupWebServer() {
             http.end();
 
             if (code >= 200 && code < 300) {
-                float net = NAN, raw = NAN, cont = 0.0f;
-                bool okParse = parseCloudNetWeights(resp, net, raw, cont);
-                int shown = wi;
-                if (okParse) {
-                    // Prefer server-computed net (weight_available)
-                    currentWeight = net;
-                    shown = roundWeight(net);
-                    // cache last server values
-                    gLastNetValid = true;
-                    gLastNetWeight = net;
-                    gLastRawWeight = raw;
-                    gLastContainer = cont;
-                } else {
-                    currentWeight = (float)wi; // fallback
-                    gLastNetValid = false;
-                }
-                // Ne pas afficher "Weight Available" - juste mettre à jour l'état
-                currentOledState = OLED_STATE_IDLE;
-                oledStateChangeMs = millis();
-                
+                currentWeight = (float)wi;
+                displayMessage("Synced \xE2\x9C\x93", String(wi) + " g", "to cloud");
+                delay(700);
                 lastUID = "";
                 lastPushedWeight = NAN;
                 stableSinceMs = 0;
                 stableCandidate = NAN;
-                displayWeightWithState(currentWeight, lastUID, currentOledState);
+                displayWeight(currentWeight, lastUID);
                 request->send(200, "application/json", "{\"status\":\"ok\"}");
             } else {
                 String err = String("{\"error\":\"upstream ") + code + "\",\"body\":" + '"' + resp + '"' + "}";
@@ -953,7 +826,7 @@ void setupWebServer() {
             while (num.length() && (num[num.length()-1] < '0' || num[num.length()-1] > '9') && num[num.length()-1] != '.' ) num.remove(num.length()-1);
             while (num.length() && ( (num[0] < '0' || num[0] > '9') && num[0] != '-' && num[0] != '.' )) num.remove(0,1);
             float w = num.toFloat();
-            int wi = roundWeight(w);
+            int wi = (int)(w + (w >= 0 ? 0.5f : -0.5f));
             if (w <= 0 && num.indexOf('0') != 0 && num.indexOf('.') != 0) { request->send(400, "application/json", "{\"error\":\"invalid weight\"}"); return; }
 
             if (apiKey.length() == 0) { request->send(400, "application/json", "{\"error\":\"missing apiKey\"}"); return; }
@@ -970,34 +843,17 @@ void setupWebServer() {
             http.end();
 
             if (code >= 200 && code < 300) {
-                // Prefer server-computed net (weight_available) for UI + WS
-                float net = NAN, raw = NAN, cont = 0.0f;
-                bool okParse = parseCloudNetWeights(resp, net, raw, cont);
-                int shown = wi;
-                if (okParse) {
-                    currentWeight = net;
-                    shown = roundWeight(net);
-                    // cache last server values
-                    gLastNetValid = true;
-                    gLastNetWeight = net;
-                    gLastRawWeight = raw;
-                    gLastContainer = cont;
-                } else {
-                    currentWeight = (float)wi;
-                    gLastNetValid = false;
-                }
-                // Ne pas afficher "Weight Available" - juste mettre à jour l'état
-                currentOledState = OLED_STATE_IDLE;
-                oledStateChangeMs = millis();
-                
+                currentWeight = (float)wi;
+                displayMessage("Synced \xE2\x9C\x93", String(wi) + " g", "to cloud");
+                delay(700);
                 lastUID = "";
                 lastPushedWeight = NAN;
                 stableSinceMs = 0;
                 stableCandidate = NAN;
                 char buf[64];
-                snprintf(buf, sizeof(buf), "{\"weight\":%d,\"uid\":\"%s\"}", shown, lastUID.c_str());
+                snprintf(buf, sizeof(buf), "{\"weight\":%d,\"uid\":\"%s\"}", wi, lastUID.c_str());
                 ws.textAll(buf);
-                displayWeightWithState(currentWeight, lastUID, currentOledState);
+                displayWeight(currentWeight, lastUID);
                 request->send(200, "application/json", "{\"status\":\"ok\"}");
             } else {
                 String err = String("{\"error\":\"upstream ") + code + "\",\"body\":" + '"' + resp + '"' + "}";
@@ -1009,22 +865,8 @@ void setupWebServer() {
     server.on("/api/tare", HTTP_POST, [](AsyncWebServerRequest *request){
         scale.tare();
         currentWeight = 0.0f;
-        resetWeightFilters();
-        lastUID = "";
-        
-        // ← AJOUTER: Sauvegarder la tare
-        float currentOffset = scale.get_offset();
-        prefs.begin("config", false);
-        prefs.putFloat("tareFactor", currentOffset);
-        prefs.end();
-        Serial.printf("[TARE] Tare sauvegardée: %f\n", currentOffset);
-        
-        // Forcer l'affichage immédiatement
-        displayWeightWithState(currentWeight, lastUID, currentOledState);
-        
         char buf[64];
-        int wInt = roundWeight(currentWeight); 
-        snprintf(buf, sizeof(buf), "{\"weight\":%d,\"uid\":\"%s\"}", wInt, lastUID.c_str());
+        snprintf(buf, sizeof(buf), "{\"weight\":%.2f,\"uid\":\"%s\"}", currentWeight, lastUID.c_str());
         ws.textAll(buf);
         request->send(200, "application/json", "{\"status\":\"ok\"}");
     });
@@ -1045,9 +887,6 @@ void setupWebServer() {
 
             calibrationFactor = f;
             scale.set_scale(calibrationFactor);
-            resetWeightFilters();
-
-            displayWeightWithState(currentWeight, lastUID, currentOledState);
             prefs.begin("config", false);
             prefs.putFloat("calFactor", calibrationFactor);
             prefs.end();
@@ -1075,24 +914,12 @@ bool pushWeightToCloud(float w) {
     if (!http.begin(url)) return false;
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-api-key", apiKey);
-    int wInt = roundWeight(w);
+    int wInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
     String payload = String("{\"uid\":\"") + lastUID + "\",\"weight\":" + String(wInt) + "}";
     int code = http.POST(payload);
     String resp = http.getString();
     http.end();
-
     if (code >= 200 && code < 300) {
-        // Parse server-computed net weight (weight_available) and cache for later display
-        float net = NAN, raw = NAN, cont = 0.0f;
-        gLastNetValid = parseCloudNetWeights(resp, net, raw, cont);
-        if (gLastNetValid) {
-            gLastNetWeight = net;
-            gLastRawWeight = raw;
-            gLastContainer = cont;
-            Serial.printf("[AutoPush] server net=%0.2f raw=%0.2f container=%0.2f\n", net, raw, cont);
-        } else {
-            Serial.println("[AutoPush] response OK but missing weight_available; fallback to sent weight");
-        }
         return true;
     }
     Serial.printf("[AutoPush] Upstream error %d: %s\n", code, resp.c_str());
@@ -1156,53 +983,29 @@ void handleAutoPush(float w) {
     sendPhase = "send";
     sendCountdown = 0;
 
-    displayMessage("Sending...", String("UID ") + lastUID, String(roundWeight(w)) + " g");
+    displayMessage("Sending...", String("UID ") + lastUID, String(w, 1) + " g");
     bool ok = pushWeightToCloud(w);
     if (ok) {
-        // Poids net reçu du cloud
-        float toDisplay = (gLastNetValid && !isnan(gLastNetWeight)) ? gLastNetWeight : w;
-        int wInt = roundWeight(toDisplay);
-
-        lastPushedWeight = toDisplay;
+        int wInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
+        lastPushedWeight = w;
         lastPushMs = now;
-
-        // SAUVEGARDER le poids ENVOYÉ et le poids net du cloud
-        gLastSentWeight = w;                    // ← Poids BRUT envoyé (avec spool)
-        gLastCloudWeight = toDisplay;           // ← Poids NET reçu (sans spool)
-        gCloudWeightSetMs = now;
-        Serial.printf("[CLOUD] Sent: %.2f g, Net: %.2f g\n", w, toDisplay);
-
-        // Ne pas afficher "Weight Available" - laisser l'état OLED gérer
-        // Mettre à jour l'état OLED directement
-        currentOledState = OLED_STATE_IDLE;
-        oledStateChangeMs = millis();
-
+        displayMessage("Synced \xE2\x9C\x93", String(wInt) + " g", "to cloud");
+        delay(700);
         lastUID = "";
         lastPushedWeight = NAN;
         stableSinceMs = 0;
         stableCandidate = NAN;
-
         char buf[64];
         snprintf(buf, sizeof(buf), "{\"weight\":%d,\"uid\":\"%s\"}", wInt, lastUID.c_str());
         ws.textAll(buf);
-
-        // Afficher le poids net reçu du cloud
-        displayWeightWithState(toDisplay, lastUID, OLED_STATE_IDLE);
-        currentWeight = toDisplay;
-
+        displayWeight((float)wInt, lastUID);
         sendPhase = "success";
         sendPhaseLastChangeMs = millis();
         sendCountdown = -1;
-        // reset cache after use to avoid stale values
-        gLastNetValid = false;
     } else {
-        displayMessage("Sync failed", "Check Wi‑Fi/API", String(roundWeight(w)) + " g");
-        delay(2000);
-
-        currentOledState = OLED_STATE_ERROR;
-        oledStateChangeMs = millis();
-
-        displayWeightWithState(w, lastUID, OLED_STATE_ERROR);
+        displayMessage("Sync failed", "Check Wi‑Fi/API", String(w, 1) + " g");
+        delay(700);
+        displayWeight(w, lastUID);
         sendPhase = "error";
         sendPhaseLastChangeMs = millis();
         sendCountdown = -1;
@@ -1256,183 +1059,42 @@ void onWiFiEvent(WiFiEvent_t event) {
 void setupScale() {
     scale.begin(HX711_DOUT, HX711_SCK);
     scale.set_scale(calibrationFactor);
+    scale.tare();
     
-    // ← MODIFIER: Charger la tare sauvegardée au lieu de faire tare()
-    prefs.begin("config", true);
-    float savedTare = prefs.getFloat("tareFactor", 0.0f);
-    prefs.end();
-    
-    if (savedTare != 0.0f) {
-        // Restaurer la tare sauvegardée
-        scale.set_offset(savedTare);
-        Serial.printf("[SCALE] Tare restaurée: %f\n", savedTare);
-        displayMessage("Scale OK", "Tare restored");
-    } else {
-        // Première utilisation: faire un tare
-        scale.tare();
-        Serial.println("[SCALE] Tare effectuée (première utilisation)");
-        displayMessage("Scale OK", "Tare done");
-    }
-    
+    displayMessage("Scale OK", "Tare done");
     delay(1000);
-}
-
-/**
- * 🔎 Détecte si le capteur est en train de changer rapidement
- * Retourne true si changement > 2g en 100ms
- */
-static bool isRapidChange(float raw) {
-    static float gLastRaw = 0.0f;
-    static uint32_t gLastRawTime = 0;
-    
-    uint32_t now = millis();
-    uint32_t dt = now - gLastRawTime;
-    
-    if (dt < 50) return false; // Trop proche, ignorer
-    
-    float delta = fabs(raw - gLastRaw);
-    gLastRaw = raw;
-    gLastRawTime = now;
-    
-    // Si delta > 2g en moins de 100ms → changement rapide (utilisateur action)
-    if (dt < 100 && delta > 2.0f) {
-        return true;
-    }
-    return false;
-}
-
-/**
- * 🔎 Applique la dead zone (zone morte)
- * Élimine les bruits de très faible amplitude
- */
-static float applyDeadZone(float value) {
-    float absVal = fabs(value);
-    if (absVal < DEAD_ZONE_G) {
-        return 0.0f;
-    }
-    // Rendre la transition douce au lieu d'un "saut"
-    return (value >= 0) 
-        ? (value - DEAD_ZONE_G) 
-        : (value + DEAD_ZONE_G);
-}
-
-/**
- * 🔎 Applique l'hystérésis pour éviter le scintillement
- * Les petits changements (< seuil) ne mettent pas à jour l'affichage
- */
-static float applyHysteresis(float newValue, float lastValue) {
-    float delta = fabs(newValue - lastValue);
-    
-    // Si la différence est trop petite, garder l'ancienne valeur
-    if (delta < HYSTERESIS_THRESHOLD) {
-        return lastValue;
-    }
-    return newValue;
-}
-
-/**
- * 🔎 Calcule la médiane de manière efficace (insertion sort)
- * Robuste contre les pics de bruit
- */
-static float computeMedian() {
-    if (gMedianCount == 0) return gEmaWeight;
-    
-    // Tri insertion (O(n²) mais n petit = 11)
-    float tmp[MEDIAN_WINDOW_LARGE];
-    memcpy(tmp, gMedianBuf, gMedianCount * sizeof(float));
-    
-    for (int i = 1; i < gMedianCount; ++i) {
-        float key = tmp[i];
-        int j = i - 1;
-        while (j >= 0 && tmp[j] > key) {
-            tmp[j+1] = tmp[j];
-            j--;
-        }
-        tmp[j+1] = key;
-    }
-    
-    // Retourner la médiane (ou moyenne des 2 du milieu si pair)
-    if (gMedianCount % 2 == 1) {
-        return tmp[gMedianCount / 2];
-    } else {
-        return (tmp[gMedianCount/2 - 1] + tmp[gMedianCount/2]) / 2.0f;
-    }
 }
 
 float readWeight() {
     if (!scale.is_ready()) {
-        return currentWeight; // Garder dernière valeur si ADC pas prêt
+        return currentWeight; // keep last value if ADC not ready
     }
 
-    // ========== ÉTAPE 1: Lecture brute ==========
-    float raw = scale.get_units(1);  // 1 lecture rapide du capteur
-    
-    // ========== ÉTAPE 2: Fenêtre médiane (robustesse) ==========
-    // Stocke les 11 dernières lectures
+    // 1) Fast raw read (low latency)
+    float raw = scale.get_units(1);
+
+    // 2) Update small median window
     gMedianBuf[gMedianIdx] = raw;
-    gMedianIdx = (gMedianIdx + 1) % MEDIAN_WINDOW_LARGE;
-    if (gMedianCount < MEDIAN_WINDOW_LARGE) gMedianCount++;
-    
-    // Calcule la médiane (valeur du milieu après tri)
-    float medianVal = computeMedian();
-    
-    // ========== ÉTAPE 3: Détection changement rapide ==========
-    // Aide à différencier "utilisateur pose objet" vs "bruit capteur"
-    bool rapidChange = isRapidChange(raw);
-    float alphaToUse = rapidChange ? EMA_ALPHA_FAST : EMA_ALPHA_FINE;
-    
-    // ========== ÉTAPE 4: Lissage exponentiel adaptatif ==========
-    if (!gEmaInit) {
-        gEmaWeight = medianVal;
-        gEmaInit = true;
-    } else {
-        // EMA: newValue = oldValue + alpha * (measured - oldValue)
-        // Converge progressivement vers la vraie valeur
-        gEmaWeight = gEmaWeight + alphaToUse * (medianVal - gEmaWeight);
+    gMedianIdx = (gMedianIdx + 1) % MEDIAN_WINDOW;
+    if (gMedianCount < MEDIAN_WINDOW) gMedianCount++;
+
+    // Compute median (tiny N → insertion sort)
+    float tmp[MEDIAN_WINDOW];
+    for (int i = 0; i < gMedianCount; ++i) tmp[i] = gMedianBuf[i];
+    for (int i = 1; i < gMedianCount; ++i) {
+        float key = tmp[i]; int j = i - 1;
+        while (j >= 0 && tmp[j] > key) { tmp[j+1] = tmp[j]; j--; }
+        tmp[j+1] = key;
     }
-    
-    // ========== ÉTAPE 5: Hysteresis (anti-scintillement) ==========
-    // Les changements < 0.3g ne mettent pas à jour l'affichage
-    float withHysteresis = applyHysteresis(gEmaWeight, gLastDisplayedWeight);
-    
-    // ========== ÉTAPE 6: Dead zone (ignore bruits mineurs) ==========
-    // Tous les poids entre -0.15g et +0.15g → 0g
-    float withDeadZone = applyDeadZone(withHysteresis);
-    
-    // ========== ÉTAPE 7: Tracking stabilité ==========
-    // Détecte si le poids s'est stabilisé depuis 800ms
-    float delta = fabs(withDeadZone - gLastDisplayedWeight);
-    if (delta < 0.2f) {
-        // Valeur quasi identique → on progresse vers stabilité
-        if (gStableStartMs == 0) {
-            gStableStartMs = millis();
-            gIsStable = false;
-        } else if (millis() - gStableStartMs > STABLE_DISPLAY_MS) {
-            gIsStable = true;  // Marqué comme stable après 800ms sans changement
-        }
-    } else {
-        // Changement détecté → reset stabilité
-        gStableStartMs = millis();
-        gIsStable = false;
-    }
-    
-    // Mémoriser pour la prochaine itération (hysteresis + stabilité)
-    gLastDisplayedWeight = withDeadZone;
-    currentWeight = withDeadZone;
-    
-    // ========== DEBUG (optionnel) ==========
-    //static uint32_t lastDebug = 0;
-    //if (millis() - lastDebug > 500) {
-    //    Serial.printf("[WEIGHT] raw=%.2f median=%.2f ema=%.2f final=%.2f stable=%s alpha=%s\n",
-    //        raw, medianVal, gEmaWeight, currentWeight, gIsStable?"YES":"NO", 
-    //        rapidChange?"FAST":"FINE");
-    //    lastDebug = millis();
-    // }
-    
+    float med = (gMedianCount > 0) ? tmp[gMedianCount/2] : raw;
+
+    // 3) Exponential moving average for extra smoothing
+    if (!gEmaInit) { gEmaWeight = med; gEmaInit = true; }
+    else { gEmaWeight = gEmaWeight + EMA_ALPHA * (med - gEmaWeight); }
+
+    currentWeight = gEmaWeight; // smoothed float (can be negative)
     return currentWeight;
 }
-
-
 
 // ============================================================================
 // GESTION RFID
@@ -1573,76 +1235,42 @@ void loop() {
     String uid = readRFID();
     if (uid.length() > 0 && uid != lastUID) {
         lastUID = uid;
-        currentOledState = OLED_STATE_UID_DETECTED;
-        oledStateChangeMs = millis();
         Serial.println("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
     }
     
     float weight = readWeight();
 
-    // ===== DÉTECTION RETRAIT DE BOBINE =====
-    // Si on a un poids envoyé au cloud et une différence > 50g → retrait détecté
-    if (!isnan(gLastSentWeight)) {
-        float delta = fabs(weight - gLastSentWeight);  // ← Comparer avec le poids ENVOYÉ, pas le net!
-        
-        if (delta > MIN_WEIGHT_CHANGE_TO_RESET_G) {
-            Serial.printf("[RETRAIT] Détecté! Envoyé: %.2f, Actuel: %.2f, Delta: %.2f\n", 
-                          gLastSentWeight, weight, delta);
-            
-            // Réinitialiser pour nouveau pesage
-            gLastSentWeight = NAN;         // ← reset du poids BRUT envoyé
-            gLastCloudWeight = NAN;
-            gCloudWeightSetMs = 0;
-            lastUID = "";
-            currentOledState = OLED_STATE_IDLE;
-            
-            // Pas d'écran spécial pour le retrait - retour direct à IDLE
-            // displayMessage() supprimé pour éviter les transitions confuses
+    // --- Hold mode logic ---
+    float displayedWeight = weight;
+    if (!holdMode) {
+        if (fabs(weight - holdWeight) < HOLD_THRESHOLD_ENTER) {
+            if (holdStartMs == 0) holdStartMs = millis();
+            if (millis() - holdStartMs > HOLD_TIME_MS) {
+                holdMode = true;
+                holdWeight = weight;
+            }
+        } else {
+            holdStartMs = 0;
+            holdWeight = weight;
+        }
+    } else {
+        if (fabs(weight - holdWeight) > HOLD_THRESHOLD_EXIT) {
+            holdMode = false;
+            holdStartMs = 0;
+            holdWeight = weight;
         }
     }
-
-    float displayedWeight = weight;
+    displayedWeight = holdMode ? holdWeight : weight;
 
     if (millis() - lastUpdate > WS_UPDATE_INTERVAL_MS) {
-        // Gestion transitions d'état OLED
-        uint32_t now = millis();
-
-        // Éviter le rollback à "Ready to weigh" :
-        // Pendant la phase de countdown, forcer l'état SENDING (affiche "Sending... Xs")
-        if (sendPhase == "countdown") {
-            if (currentOledState != OLED_STATE_SENDING) {
-                currentOledState = OLED_STATE_SENDING;
-                oledStateChangeMs = now;
-            }
-        }
-
-        // Retour à IDLE après affichage message (succès/erreur/UID détecté)
-        if ((currentOledState == OLED_STATE_UID_DETECTED ||
-             currentOledState == OLED_STATE_SUCCESS ||
-             currentOledState == OLED_STATE_ERROR) &&
-            (now - oledStateChangeMs > OLED_MESSAGE_DURATION_MS)) {
-            if (sendPhase == "countdown") {
-                currentOledState = OLED_STATE_SENDING; // rester sur SENDING (compte à rebours)
-            } else {
-                currentOledState = OLED_STATE_IDLE;
-            }
-        }
-
-        // Passer à SENDING si handleAutoPush a initié l'envoi
-        if (sendPhase == "send" && currentOledState != OLED_STATE_SENDING) {
-            currentOledState = OLED_STATE_SENDING;
-            oledStateChangeMs = now;
-        }
-
-        // Afficher avec l'état courant
-        displayWeightWithState(displayedWeight, lastUID, currentOledState);
-
-        int wInt = roundWeight(displayedWeight);
-        String json = "{\"weight\":" + String(wInt) +
+        displayWeight(displayedWeight, lastUID);
+        
+        int wInt = (int)(displayedWeight + (displayedWeight >= 0 ? 0.5f : -0.5f));
+        String json = "{\"weight\":" + String(wInt) + 
                       ",\"uid\":\"" + lastUID + "\"}";
         ws.textAll(json);
         ws.cleanupClients();
-
+        
         lastUpdate = millis();
     }
 

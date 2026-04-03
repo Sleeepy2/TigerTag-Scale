@@ -5,7 +5,7 @@
 Import("env")
 import os, gzip, shutil
 
-print("🔧 Script gzip_www.py chargé - sync & gzip auto")
+print("[gzip_www] script loaded - sync and gzip auto")
 
 ROOT = env["PROJECT_DIR"]
 WWW  = os.path.join(ROOT, "data", "www")
@@ -79,11 +79,11 @@ def pre_gzip_www(source, target, env):
     sync_from_src(SRC, WWW)
 
     # 2) supprime les anciens .gz
-    print("[gzip] cleaning old .gz …")
+    print("[gzip] cleaning old .gz ...")
     clean_old_gz(WWW)
 
     # 3) (re)génère les .gz pour chaque .html/.css/.js présent dans data/www
-    print("[gzip] generating fresh .gz …")
+    print("[gzip] generating fresh .gz ...")
     build_gz_for_sources(WWW)
     print("[gzip] done.")
     print(f"[summary] synced {COPIED} file(s) from web-src and gzipped {GZ_MADE} file(s)")

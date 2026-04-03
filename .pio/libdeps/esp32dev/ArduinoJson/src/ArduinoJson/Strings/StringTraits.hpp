@@ -1,5 +1,5 @@
 // ArduinoJson - https://arduinojson.org
-// Copyright © 2014-2023, Benoit BLANCHON
+// Copyright © 2014-2026, Benoit BLANCHON
 // MIT License
 
 #pragma once
@@ -38,16 +38,15 @@ struct has_data<T,
                                            const char*>::value>::type>
     : true_type {};
 
-// size_t length() const
+// unsigned int length() const
 // - String
 
 template <class T, class = void>
 struct has_length : false_type {};
 
 template <class T>
-struct has_length<
-    T, typename enable_if<
-           is_same<decltype(declval<const T>().length()), size_t>::value>::type>
+struct has_length<T, typename enable_if<is_unsigned<
+                         decltype(declval<const T>().length())>::value>::type>
     : true_type {};
 
 // size_t size() const

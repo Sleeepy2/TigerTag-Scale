@@ -160,6 +160,21 @@
             </div>
         </div>
 
+        <!-- Spoolman -->
+        <div class="card">
+            <div class="card-title collapsible" onclick="toggleSection(this)">
+                <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/spoolman.svg" alt="Spoolman" style="width: 18px; height: 18px; object-fit: contain;">
+                <span>Spoolman</span>
+            </div>
+            <div class="collapsible-content">
+                <input type="url" id="spoolmanUrl" placeholder="Spoolman URL">
+                <div style="height: 8px;"></div>
+                <input type="password" id="spoolmanToken" placeholder="Spoolman API token (optional)" autocomplete="new-password">
+                <div class="info-badge" style="margin: 12px 0;">The device will match scanned UIDs against the spool custom field `rfid_uid`.</div>
+                <button onclick="saveSpoolmanConfig()">Save Spoolman</button>
+            </div>
+        </div>
+
         <!-- Advanced -->
         <div class="card">
             <div class="card-title collapsible" onclick="toggleSection(this)">

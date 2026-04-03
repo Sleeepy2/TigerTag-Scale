@@ -223,11 +223,20 @@ let calFactor = null;
 let apiKey = '';
 let cloudStatus = 'unknown';
 let apiStatus = 'none';
+let spoolmanUrl = '';
+let spoolmanToken = '';
 
 // ========== UTILITIES ==========
 function setTextIfChanged(el, txt) {
     if (!el || el.textContent === txt) return;
     el.textContent = txt;
+}
+
+function setInputIfIdle(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (document.activeElement === el) return;
+    if (el.value !== value) el.value = value;
 }
 
 function toggleSection(el) {
@@ -383,6 +392,40 @@ function deleteApiKey() {
       })
       .catch(() => alert(t('alertDeleteError')))
       .finally(() => { if (delBtn) { delBtn.disabled = false; delBtn.textContent = t('delete'); } });
+}
+
+function saveSpoolmanConfig() {
+    const urlInput = document.getElementById('spoolmanUrl');
+    const tokenInput = document.getElementById('spoolmanToken');
+    const btn = document.querySelector('button[onclick="saveSpoolmanConfig()"]');
+    const payload = {
+        url: (urlInput && urlInput.value ? urlInput.value : '').trim(),
+        token: (tokenInput && tokenInput.value ? tokenInput.value : '').trim()
+    };
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
+
+    fetch('/api/spoolman', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(res => {
+        if (!res.success) throw new Error('save failed');
+        spoolmanUrl = payload.url;
+        spoolmanToken = payload.token;
+    })
+    .catch(() => alert('Error saving Spoolman settings'))
+    .finally(() => {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save Spoolman';
+        }
+    });
 }
 
 // ========== API KEY VISIBILITY TOGGLE ==========
@@ -808,6 +851,15 @@ function applyStatusSnapshot(s) {
         const hasKey = s.apiKey.trim().length > 0;
         const state = hasKey ? (s.apiValid ? 'valid' : 'invalid') : 'none';
         setApiStatus(state, s.displayName || '');
+    }
+
+    if (typeof s.spoolmanUrl === 'string') {
+        spoolmanUrl = s.spoolmanUrl;
+        setInputIfIdle('spoolmanUrl', spoolmanUrl);
+    }
+    if (typeof s.spoolmanToken === 'string') {
+        spoolmanToken = s.spoolmanToken;
+        setInputIfIdle('spoolmanToken', spoolmanToken);
     }
     
     // Calibration factor

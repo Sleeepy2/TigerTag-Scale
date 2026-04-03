@@ -1,10 +1,10 @@
 // ArduinoJson - https://arduinojson.org
-// Copyright © 2014-2023, Benoit BLANCHON
+// Copyright © 2014-2026, Benoit BLANCHON
 // MIT License
 
 #pragma once
 
-#include <ArduinoJson/MsgPack/endianess.hpp>
+#include <ArduinoJson/MsgPack/endianness.hpp>
 #include <ArduinoJson/Polyfills/assert.hpp>
 #include <ArduinoJson/Polyfills/type_traits.hpp>
 #include <ArduinoJson/Serialization/CountingDecorator.hpp>
@@ -190,7 +190,7 @@ class MsgPackSerializer : public Visitor<size_t> {
 
   template <typename T>
   void writeInteger(T value) {
-    fixEndianess(value);
+    fixEndianness(value);
     writeBytes(reinterpret_cast<uint8_t*>(&value), sizeof(value));
   }
 

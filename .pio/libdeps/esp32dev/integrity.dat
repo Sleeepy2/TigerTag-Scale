@@ -1,8 +1,8 @@
-adafruit/Adafruit SSD1306 @ ^2.5.7
-me-no-dev/AsyncTCP @ ^1.1.1
-bblanchon/ArduinoJson@^6.21.5
-me-no-dev/ESPAsyncWebServer @ ^1.2.3
-miguelbalboa/MFRC522 @ ^1.4.10
-bogde/HX711 @ ^0.7.5
 tzapu/WiFiManager @ ^2.0.16-rc.2
+me-no-dev/AsyncTCP @ ^1.1.1
+miguelbalboa/MFRC522 @ ^1.4.10
 adafruit/Adafruit GFX Library @ ^1.11.3
+bblanchon/ArduinoJson@^6.21.5
+me-no-dev/ESPAsyncWebServer@^1.2.3
+adafruit/Adafruit SSD1306 @ ^2.5.7
+bogde/HX711 @ ^0.7.5

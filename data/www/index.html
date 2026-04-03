@@ -8,11 +8,11 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="TigerTag">
     <meta name="description" content="TigerTag Scale - Professional weight management">
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" href="favicon.png">
-    <link rel="apple-touch-icon" href="favicon.png">
-    <link rel="manifest" href="manifest.json">
-    <link rel="stylesheet" href="styles.css">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <link rel="apple-touch-icon" href="/favicon.png">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="stylesheet" href="/styles.css">
     <title>TigerTag Scale</title>
 </head>
 <body>
@@ -69,7 +69,7 @@
                 <div style="position: relative;">
                     <input type="password" id="newApiKey" data-i18n-placeholder="newApiKey" placeholder="Nouvelle clé API" autocomplete="new-password" style="padding-right: 50px;">
                     <button class="eye-btn" onclick="toggleApiKeyVisibility()" type="button" title="Afficher/Masquer">
-                        <img id="eyeIcon" src="img/visibility_off.svg" alt="Toggle visibility" style="width: 20px; height: 20px;">
+                        <img id="eyeIcon" src="/img/visibility_off.svg" alt="Toggle visibility" style="width: 20px; height: 20px;">
                     </button>
                 </div>
                 <div class="button-group">
@@ -160,6 +160,21 @@
             </div>
         </div>
 
+        <!-- Spoolman -->
+        <div class="card">
+            <div class="card-title collapsible" onclick="toggleSection(this)">
+                <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/spoolman.svg" alt="Spoolman" style="width: 18px; height: 18px; object-fit: contain;">
+                <span>Spoolman</span>
+            </div>
+            <div class="collapsible-content">
+                <input type="url" id="spoolmanUrl" placeholder="Spoolman URL">
+                <div style="height: 8px;"></div>
+                <input type="password" id="spoolmanToken" placeholder="Spoolman API token (optional)" autocomplete="new-password">
+                <div class="info-badge" style="margin: 12px 0;">The device will match scanned UIDs against the spool custom field `rfid_uid`.</div>
+                <button onclick="saveSpoolmanConfig()">Save Spoolman</button>
+            </div>
+        </div>
+
         <!-- Advanced -->
         <div class="card">
             <div class="card-title collapsible" onclick="toggleSection(this)">
@@ -219,6 +234,6 @@
         </div>
     </div>
     
-    <script src="script.js"></script>
+    <script src="/script.js"></script>
 </body>
 </html>

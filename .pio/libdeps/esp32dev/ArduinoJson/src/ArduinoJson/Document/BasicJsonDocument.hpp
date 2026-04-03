@@ -1,5 +1,5 @@
 // ArduinoJson - https://arduinojson.org
-// Copyright © 2014-2023, Benoit BLANCHON
+// Copyright © 2014-2026, Benoit BLANCHON
 // MIT License
 
 #pragma once
@@ -136,7 +136,10 @@ class BasicJsonDocument : AllocatorOwner<TAllocator>, public JsonDocument {
  private:
   detail::MemoryPool allocPool(size_t requiredSize) {
     size_t capa = detail::addPadding(requiredSize);
-    return {reinterpret_cast<char*>(this->allocate(capa)), capa};
+    if (capa)
+      return {reinterpret_cast<char*>(this->allocate(capa)), capa};
+    else
+      return {0, 0};
   }
 
   void reallocPool(size_t requiredSize) {

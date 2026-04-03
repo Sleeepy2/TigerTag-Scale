@@ -20,6 +20,7 @@
 #include <MFRC522.h>
 #include <SPI.h>
 #include <LittleFS.h>  // ← AJOUTÉ pour filesystem
+#include <math.h>
 
 // ============================================================================
 // CONFIGURATION MATERIELLE
@@ -87,6 +88,8 @@ String apiKey = "";
 String apiDisplayName = "";     // cached display name for validated API key
 bool apiValid = false;          // last known validation state
 uint32_t lastApiBroadcastMs = 0; // WS broadcast throttle for apiStatus
+String spoolmanUrl = "";
+String spoolmanToken = "";
 float calibrationFactor = 406;
 float currentWeight = 0.0;
 // --- Hold mode variables ---
@@ -130,6 +133,52 @@ static int   gMedianCount = 0; // <= MEDIAN_WINDOW
 volatile int sendCountdown = -1;         // -1 = no countdown, >=0 = seconds remaining
 String sendPhase = "";                  // "" | "countdown" | "send" | "success" | "error"
 uint32_t sendPhaseLastChangeMs = 0;      // for expiring transient phases (success/error)
+bool spoolmanSyncPending = false;
+String spoolmanDisplayLine1 = "";
+String spoolmanDisplayLine2 = "";
+uint32_t spoolmanDisplayUntilMs = 0;
+
+struct TigerTagData {
+    bool valid = false;
+    uint32_t tigerTagId = 0;
+    uint32_t productId = 0;
+    uint16_t materialId = 0;
+    uint8_t aspect1Id = 0;
+    uint8_t aspect2Id = 0;
+    uint8_t typeId = 0;
+    uint8_t diameterId = 0;
+    uint16_t brandId = 0;
+    uint8_t colorR = 0;
+    uint8_t colorG = 0;
+    uint8_t colorB = 0;
+    uint8_t colorA = 0;
+    uint32_t weightValue = 0;
+    uint8_t weightUnitId = 0;
+    uint16_t tempMin = 0;
+    uint16_t tempMax = 0;
+    uint8_t dryTemp = 0;
+    uint8_t dryTime = 0;
+};
+
+struct TigerTagProductInfo {
+    bool valid = false;
+    String name;
+    String material;
+    String brand;
+    String productType;
+    String externalId;
+    String colorHex;
+    float diameterMm = NAN;
+    float netWeightG = NAN;
+    int extruderTemp = -1;
+};
+
+TigerTagData lastTigerTagData;
+
+struct TigerTagResolvedMeta {
+    String brandName;
+    String materialName;
+};
 
 // ============================================================================
 // AFFICHAGE OLED
@@ -172,6 +221,636 @@ bool pushWeightToCloud(float w);
 void handleAutoPush(float w);
 bool validateApiKeyFirmware(const String& key, String& displayNameOut);
 bool deleteApiKey();
+void showSpoolmanStatus(const String& line1, const String& line2 = "", uint32_t durationMs = 1800);
+String normalizeSpoolmanBaseUrl(const String& raw);
+String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut);
+bool fetchTigerTagProductInfo(const String& uid, uint32_t productId, TigerTagProductInfo& infoOut, String& errorOut);
+bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta& metaOut, String& errorOut);
+String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut);
+String ensureSpoolmanVendor(const String& vendorName, String& errorOut);
+String findSpoolmanFilamentIdByExternalId(const String& externalId, String& errorOut);
+String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, String& errorOut);
+String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut);
+bool syncWeightToSpoolman(const String& uid, float w, String& errorOut);
+void saveSpoolmanConfig();
+
+static String jsonEscape(const String& input) {
+    String out;
+    out.reserve(input.length() + 8);
+    for (size_t i = 0; i < input.length(); i++) {
+        const char c = input[i];
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+static uint16_t readU16LE(const uint8_t* data) {
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint16_t readU16BE(const uint8_t* data) {
+    return ((uint16_t)data[0] << 8) | (uint16_t)data[1];
+}
+
+static uint32_t readU32LE(const uint8_t* data) {
+    return (uint32_t)data[0]
+        | ((uint32_t)data[1] << 8)
+        | ((uint32_t)data[2] << 16)
+        | ((uint32_t)data[3] << 24);
+}
+
+static uint32_t readU32BE(const uint8_t* data) {
+    return ((uint32_t)data[0] << 24)
+        | ((uint32_t)data[1] << 16)
+        | ((uint32_t)data[2] << 8)
+        | (uint32_t)data[3];
+}
+
+static String colorToHex(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    char buf[9];
+    snprintf(buf, sizeof(buf), "%02X%02X%02X%02X", r, g, b, a);
+    return String(buf);
+}
+
+static float inferDensityFromMaterialName(const String& materialName) {
+    String m = materialName;
+    m.toUpperCase();
+    if (m.indexOf("PLA") >= 0) return 1.24f;
+    if (m.indexOf("PETG") >= 0) return 1.27f;
+    if (m.indexOf("ABS") >= 0) return 1.04f;
+    if (m.indexOf("ASA") >= 0) return 1.07f;
+    if (m.indexOf("TPU") >= 0) return 1.21f;
+    if (m.indexOf("NYLON") >= 0 || m.indexOf("PA") >= 0) return 1.14f;
+    if (m.indexOf("PC") >= 0) return 1.20f;
+    return 1.24f;
+}
+
+static String urlEncode(const String& input) {
+    String out;
+    const char* hex = "0123456789ABCDEF";
+    for (size_t i = 0; i < input.length(); i++) {
+        unsigned char c = (unsigned char)input[i];
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[(c >> 4) & 0x0F];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+static void dumpPageBytes(const char* label, const uint8_t* data, size_t len) {
+    Serial.printf("[TigerTag] %s:", label);
+    for (size_t i = 0; i < len; i++) {
+        Serial.printf(" %02X", data[i]);
+    }
+    Serial.println();
+}
+
+static bool readNTAGBlock(byte startPage, uint8_t out[16], String& errorOut) {
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    MFRC522::StatusCode status = rfid.MIFARE_Read(startPage, buffer, &size);
+    if (status != MFRC522::STATUS_OK) {
+        errorOut = String("MIFARE_Read page ") + startPage + " failed: " + rfid.GetStatusCodeName(status);
+        return false;
+    }
+    memcpy(out, buffer, 16);
+    return true;
+}
+
+static bool readTigerTagData(TigerTagData& dataOut, String& errorOut) {
+    errorOut = "";
+    uint8_t page4[16];
+    uint8_t page8[16];
+    uint8_t page12[16];
+    if (!readNTAGBlock(4, page4, errorOut)) return false;
+    if (!readNTAGBlock(8, page8, errorOut)) return false;
+    if (!readNTAGBlock(12, page12, errorOut)) return false;
+    dumpPageBytes("pages4-7", page4, 16);
+    dumpPageBytes("pages8-11", page8, 16);
+    dumpPageBytes("pages12-15", page12, 16);
+
+    TigerTagData data;
+    data.valid = true;
+    data.tigerTagId = readU32BE(&page4[0]);
+    data.productId = readU32BE(&page4[4]);
+    data.materialId = readU16BE(&page4[8]);
+    data.aspect1Id = page4[10];
+    data.aspect2Id = page4[11];
+    data.typeId = page4[12];
+    data.diameterId = page4[13];
+    data.brandId = readU16BE(&page4[14]);
+    data.colorR = page8[0];
+    data.colorG = page8[1];
+    data.colorB = page8[2];
+    data.colorA = page8[3];
+    data.weightValue = ((uint32_t)page8[4] << 16) | ((uint32_t)page8[5] << 8) | (uint32_t)page8[6];
+    data.weightUnitId = page8[7];
+    data.tempMin = readU16BE(&page8[8]);
+    data.tempMax = readU16BE(&page8[10]);
+    data.dryTemp = page8[12];
+    data.dryTime = page8[13];
+    dataOut = data;
+    return true;
+}
+
+String normalizeSpoolmanBaseUrl(const String& raw) {
+    String value = raw;
+    value.trim();
+    while (value.endsWith("/")) value.remove(value.length() - 1);
+    return value;
+}
+
+void saveSpoolmanConfig() {
+    prefs.begin("config", false);
+    prefs.putString("spoolmanUrl", spoolmanUrl);
+    prefs.putString("spoolmanToken", spoolmanToken);
+    prefs.end();
+}
+
+bool fetchTigerTagProductInfo(const String& uid, uint32_t productId, TigerTagProductInfo& infoOut, String& errorOut) {
+    errorOut = "";
+    infoOut = TigerTagProductInfo();
+
+    HTTPClient http;
+    String url = String("https://api.tigertag.io/api:tigertag/product/get?uid=") + uid +
+                 "&product_id=" + String(productId) + "&lang=en";
+    Serial.printf("[TigerTag] Fetch product info via %s\n", url.c_str());
+    if (!http.begin(url)) {
+        errorOut = "TigerTag http begin failed";
+        return false;
+    }
+
+    int code = http.GET();
+    String body = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = String("TigerTag HTTP ") + code + ": " + body;
+        return false;
+    }
+
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        errorOut = String("TigerTag json parse failed: ") + err.c_str();
+        return false;
+    }
+
+    TigerTagProductInfo info;
+    info.valid = true;
+    info.externalId = String("tigertag:") + String(productId);
+
+    JsonVariant root = doc.as<JsonVariant>();
+    info.name = String((const char*)(root["name"] | ""));
+    info.material = String((const char*)(root["material"] | ""));
+    info.brand = String((const char*)(root["brand"] | ""));
+    info.productType = String((const char*)(root["product_type"] | ""));
+
+    if (root["color"].is<const char*>()) {
+        info.colorHex = String((const char*)root["color"]);
+        info.colorHex.replace("#", "");
+    }
+    if (root["measure_value"].is<float>() || root["measure_value"].is<int>()) {
+        info.netWeightG = root["measure_value"].as<float>();
+    }
+    if (root["diameter"].is<float>() || root["diameter"].is<int>()) {
+        info.diameterMm = root["diameter"].as<float>();
+    }
+
+    infoOut = info;
+    return true;
+}
+
+static bool fetchTigerTagSimpleName(const String& url, const char* fieldName, String& valueOut, String& errorOut) {
+    errorOut = "";
+    valueOut = "";
+    HTTPClient http;
+    if (!http.begin(url)) {
+        errorOut = "TigerTag http begin failed";
+        return false;
+    }
+    int code = http.GET();
+    String body = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = String("TigerTag HTTP ") + code + ": " + body;
+        return false;
+    }
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        errorOut = String("TigerTag json parse failed: ") + err.c_str();
+        return false;
+    }
+    if (doc[fieldName].is<const char*>()) valueOut = String((const char*)doc[fieldName]);
+    if (!valueOut.length() && doc["label"].is<const char*>()) valueOut = String((const char*)doc["label"]);
+    return valueOut.length() > 0;
+}
+
+bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta& metaOut, String& errorOut) {
+    errorOut = "";
+    metaOut = TigerTagResolvedMeta();
+    String err;
+    String brandUrl = String("https://api.tigertag.io/api:tigertag/brand/get?id=") + String(tagData.brandId);
+    String materialUrl = String("https://api.tigertag.io/api:tigertag/material/filament/get?id=") + String(tagData.materialId) + "&lang=en";
+
+    fetchTigerTagSimpleName(brandUrl, "name", metaOut.brandName, err);
+    if (!err.isEmpty()) Serial.printf("[TigerTag] Brand lookup failed for %u: %s\n", (unsigned)tagData.brandId, err.c_str());
+    err = "";
+    fetchTigerTagSimpleName(materialUrl, "label", metaOut.materialName, err);
+    if (!err.isEmpty()) Serial.printf("[TigerTag] Material lookup failed for %u: %s\n", (unsigned)tagData.materialId, err.c_str());
+    return metaOut.brandName.length() > 0 || metaOut.materialName.length() > 0;
+}
+
+String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut) {
+    errorOut = "";
+    if (!vendorName.length()) return "";
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    HTTPClient http;
+    String url = baseUrl + "/api/v1/vendor?name=" + urlEncode(vendorName);
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    if (spoolmanToken.length() > 0) http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    int code = http.GET();
+    if (code < 200 || code >= 300) {
+        String resp = http.getString();
+        http.end();
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+    DynamicJsonDocument filter(128);
+    filter[0]["id"] = true;
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, *http.getStreamPtr(), DeserializationOption::Filter(filter));
+    http.end();
+    if (err) {
+        errorOut = String("json parse failed: ") + err.c_str();
+        return "";
+    }
+    JsonArray vendors = doc.as<JsonArray>();
+    if (vendors.size() > 0) return String((int)vendors[0]["id"]);
+    return "";
+}
+
+String ensureSpoolmanVendor(const String& vendorName, String& errorOut) {
+    errorOut = "";
+    if (!vendorName.length()) return "";
+    String vendorId = findSpoolmanVendorIdByName(vendorName, errorOut);
+    if (vendorId.length() > 0) return vendorId;
+    if (errorOut.length() > 0) return "";
+
+    DynamicJsonDocument payload(256);
+    payload["name"] = vendorName;
+    String payloadStr;
+    serializeJson(payload, payloadStr);
+
+    HTTPClient http;
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String url = baseUrl + "/api/v1/vendor";
+    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    if (spoolmanToken.length() > 0) http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    int code = http.POST(payloadStr);
+    String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+    DynamicJsonDocument responseDoc(1024);
+    DeserializationError createErr = deserializeJson(responseDoc, resp);
+    if (createErr) {
+        errorOut = String("json parse failed: ") + createErr.c_str();
+        return "";
+    }
+    return String((int)responseDoc["id"]);
+}
+
+String findSpoolmanFilamentIdByExternalId(const String& externalId, String& errorOut) {
+    errorOut = "";
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    if (baseUrl.length() == 0) {
+        errorOut = "spoolman url missing";
+        return "";
+    }
+
+    HTTPClient http;
+    String url = baseUrl + "/api/v1/filament?external_id=" + externalId;
+    url = baseUrl + "/api/v1/filament?external_id=" + urlEncode(externalId);
+    Serial.printf("[Spoolman] Lookup filament via %s\n", url.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    if (spoolmanToken.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    }
+
+    int code = http.GET();
+    if (code < 200 || code >= 300) {
+        String resp = http.getString();
+        http.end();
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+
+    DynamicJsonDocument filter(128);
+    filter[0]["id"] = true;
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, *http.getStreamPtr(), DeserializationOption::Filter(filter));
+    http.end();
+    if (err) {
+        errorOut = String("json parse failed: ") + err.c_str();
+        return "";
+    }
+
+    JsonArray filaments = doc.as<JsonArray>();
+    if (filaments.size() > 0) {
+        return String((int)filaments[0]["id"]);
+    }
+    return "";
+}
+
+String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, String& errorOut) {
+    errorOut = "";
+    TigerTagProductInfo productInfo;
+    String tigerErr;
+    bool hasProductInfo = fetchTigerTagProductInfo(uid, tagData.productId, productInfo, tigerErr);
+    if (!hasProductInfo) {
+        Serial.printf("[TigerTag] Product lookup failed for uid=%s product_id=%u: %s\n", uid.c_str(), (unsigned)tagData.productId, tigerErr.c_str());
+    }
+
+    bool hasValidProductId = !(tagData.productId == 0 || tagData.productId == 0xFFFFFFFFu);
+    String externalId = hasValidProductId
+        ? (String("tigertag:") + String(tagData.productId))
+        : (String("tigertag-uid:") + uid);
+    String filamentId = findSpoolmanFilamentIdByExternalId(externalId, errorOut);
+    if (filamentId.length() > 0) {
+        Serial.printf("[Spoolman] Using existing filament %s for %s\n", filamentId.c_str(), externalId.c_str());
+        return filamentId;
+    }
+    if (errorOut.length() > 0) return "";
+
+    String filamentName = hasProductInfo && productInfo.name.length()
+        ? productInfo.name
+        : (hasValidProductId ? (String("TigerTag Product ") + String(tagData.productId)) : (String("TigerTag UID ") + uid));
+    String materialName = hasProductInfo && productInfo.material.length() ? productInfo.material : String("Material ") + String(tagData.materialId);
+    String brandName = hasProductInfo && productInfo.brand.length() ? productInfo.brand : "";
+    if (!hasProductInfo || !brandName.length() || materialName.startsWith("Material ")) {
+        TigerTagResolvedMeta resolvedMeta;
+        String metaErr;
+        if (fetchTigerTagResolvedMeta(tagData, resolvedMeta, metaErr)) {
+            if (!brandName.length() && resolvedMeta.brandName.length()) brandName = resolvedMeta.brandName;
+            if (materialName.startsWith("Material ") && resolvedMeta.materialName.length()) materialName = resolvedMeta.materialName;
+        }
+    }
+    if (!hasProductInfo) {
+        if (brandName.length() && materialName.length()) filamentName = brandName + " " + materialName;
+        else if (materialName.length()) filamentName = materialName;
+    }
+    String colorHex = hasProductInfo && productInfo.colorHex.length() ? productInfo.colorHex : colorToHex(tagData.colorR, tagData.colorG, tagData.colorB, tagData.colorA);
+    float diameter = !isnan(productInfo.diameterMm) ? productInfo.diameterMm : (tagData.diameterId == 56 ? 1.75f : (tagData.diameterId == 221 ? 2.85f : NAN));
+    float netWeight = !isnan(productInfo.netWeightG) ? productInfo.netWeightG : (tagData.weightValue > 0 ? (float)tagData.weightValue : NAN);
+    float density = inferDensityFromMaterialName(materialName);
+    int extruderTemp = (tagData.tempMin > 0 && tagData.tempMax >= tagData.tempMin) ? (int)((tagData.tempMin + tagData.tempMax) / 2) : -1;
+    String vendorId = "";
+    if (brandName.length()) {
+        String vendorErr;
+        vendorId = ensureSpoolmanVendor(brandName, vendorErr);
+        if (vendorErr.length()) Serial.printf("[Spoolman] Vendor ensure failed for %s: %s\n", brandName.c_str(), vendorErr.c_str());
+    }
+
+    DynamicJsonDocument payload(1024);
+    payload["name"] = filamentName;
+    payload["material"] = materialName;
+    payload["external_id"] = externalId;
+    if (vendorId.length()) payload["vendor_id"] = vendorId.toInt();
+    payload["color_hex"] = colorHex;
+    payload["density"] = density;
+    if (!isnan(diameter)) payload["diameter"] = diameter;
+    if (!isnan(netWeight) && netWeight > 0) payload["weight"] = netWeight;
+    if (extruderTemp > 0) payload["settings_extruder_temp"] = extruderTemp;
+
+    String payloadStr;
+    serializeJson(payload, payloadStr);
+
+    HTTPClient http;
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String url = baseUrl + "/api/v1/filament";
+    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    if (spoolmanToken.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    }
+    int code = http.POST(payloadStr);
+    String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+
+    DynamicJsonDocument responseDoc(2048);
+    DeserializationError createErr = deserializeJson(responseDoc, resp);
+    if (createErr) {
+        errorOut = String("json parse failed: ") + createErr.c_str();
+        return "";
+    }
+
+    String createdFilamentId = String((int)responseDoc["id"]);
+    Serial.printf("[Spoolman] Created filament %s for %s\n", createdFilamentId.c_str(), externalId.c_str());
+    return createdFilamentId;
+}
+
+String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut) {
+    String filamentId = ensureSpoolmanFilament(uid, tagData, errorOut);
+    if (filamentId.length() == 0) return "";
+
+    DynamicJsonDocument payload(1024);
+    payload["filament_id"] = filamentId.toInt();
+    int currentWeight = (int)(currentMeasuredWeight + (currentMeasuredWeight >= 0 ? 0.5f : -0.5f));
+    if (currentWeight < 0) currentWeight = 0;
+    payload["remaining_weight"] = currentWeight;
+    if (tagData.weightValue > 0) payload["initial_weight"] = tagData.weightValue;
+    JsonObject extra = payload.createNestedObject("extra");
+    extra["rfid_uid"] = uid;
+
+    String payloadStr;
+    serializeJson(payload, payloadStr);
+
+    HTTPClient http;
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String url = baseUrl + "/api/v1/spool";
+    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    if (spoolmanToken.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    }
+    int code = http.POST(payloadStr);
+    String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+
+    DynamicJsonDocument responseDoc(2048);
+    DeserializationError createErr = deserializeJson(responseDoc, resp);
+    if (createErr) {
+        errorOut = String("json parse failed: ") + createErr.c_str();
+        return "";
+    }
+
+    String spoolId = String((int)responseDoc["id"]);
+    Serial.printf("[Spoolman] Created spool %s for UID %s\n", spoolId.c_str(), uid.c_str());
+    return spoolId;
+}
+
+String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
+    errorOut = "";
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    if (baseUrl.length() == 0) {
+        errorOut = "spoolman url missing";
+        return "";
+    }
+
+    HTTPClient http;
+    const String url = baseUrl + "/api/v1/spool";
+    Serial.printf("[Spoolman] Lookup UID %s via %s\n", uid.c_str(), url.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+
+    if (spoolmanToken.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    }
+
+    const int code = http.GET();
+    if (code < 200 || code >= 300) {
+        const String resp = http.getString();
+        http.end();
+        errorOut = String("HTTP ") + code;
+        if (resp.length() > 0) errorOut += ": " + resp;
+        return "";
+    }
+
+    DynamicJsonDocument filter(256);
+    filter[0]["id"] = true;
+    filter[0]["extra_rfid_uid"] = true;
+
+    DynamicJsonDocument doc(24576);
+    DeserializationError err = deserializeJson(doc, *http.getStreamPtr(), DeserializationOption::Filter(filter));
+    http.end();
+    if (err) {
+        errorOut = String("json parse failed: ") + err.c_str();
+        return "";
+    }
+
+    JsonArray spools = doc.as<JsonArray>();
+    Serial.printf("[Spoolman] Lookup response contains %u spool entries\n", (unsigned)spools.size());
+    for (JsonObject spool : spools) {
+        const char* extraUidRaw = spool["extra_rfid_uid"] | "";
+        String extraUid = String(extraUidRaw);
+        extraUid.trim();
+        if (extraUid == uid) {
+            String spoolId = String((int)spool["id"]);
+            Serial.printf("[Spoolman] UID %s matched spool %s\n", uid.c_str(), spoolId.c_str());
+            return spoolId;
+        }
+    }
+
+    errorOut = "no spool with extra_rfid_uid";
+    return "";
+}
+
+bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
+    errorOut = "";
+    if (!wifiConnected || !WiFi.isConnected()) {
+        errorOut = "wifi disconnected";
+        return false;
+    }
+
+    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    if (baseUrl.length() == 0) {
+        errorOut = "spoolman url missing";
+        return false;
+    }
+
+    const String spoolId = findSpoolmanSpoolIdByUid(uid, errorOut);
+    String resolvedSpoolId = spoolId;
+    if (resolvedSpoolId.length() == 0) {
+        if (errorOut == "no spool with extra_rfid_uid") {
+            if (!lastTigerTagData.valid) {
+                errorOut = "no spool with extra_rfid_uid and no TigerTag payload available";
+                return false;
+            }
+            Serial.printf("[Spoolman] No spool found for UID %s, creating one from TigerTag data\n", uid.c_str());
+            resolvedSpoolId = createSpoolmanSpool(uid, lastTigerTagData, w, errorOut);
+            if (resolvedSpoolId.length() == 0) return false;
+        } else {
+            return false;
+        }
+    }
+
+    HTTPClient http;
+    const String url = baseUrl + "/api/v1/spool/" + resolvedSpoolId;
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return false;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    if (spoolmanToken.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    }
+
+    const int weightInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
+    const int clampedWeight = weightInt < 0 ? 0 : weightInt;
+    String payload = String("{\"remaining_weight\":") + String(clampedWeight) + "}";
+    Serial.printf("[Spoolman] PATCH %s payload=%s\n", url.c_str(), payload.c_str());
+    const int code = http.PATCH(payload);
+    const String resp = http.getString();
+    http.end();
+
+    if (code >= 200 && code < 300) return true;
+
+    errorOut = String("HTTP ") + code;
+    if (resp.length() > 0) errorOut += ": " + resp;
+    return false;
+}
 
 // 🔎 OLED Display: Main function for rendering weight and tag info on the OLED.
 //    Shows WiFi status, weight (large digits), UID, and device IP.
@@ -197,8 +876,16 @@ void displayWeight(float weight, const String& uid) {
     display.print(wInt);
     display.println(" g");
     
-    // UID
-    if (uid.length() > 0) {
+    // UID or transient Spoolman status
+    if (spoolmanDisplayUntilMs > millis() && spoolmanDisplayLine1.length() > 0) {
+        display.setTextSize(1);
+        display.setCursor(0, 40);
+        display.println(spoolmanDisplayLine1);
+        if (spoolmanDisplayLine2.length() > 0) {
+            display.setCursor(0, 49);
+            display.println(spoolmanDisplayLine2);
+        }
+    } else if (uid.length() > 0) {
         display.setTextSize(1);
         display.setCursor(0, 45);
         display.print("UID:");
@@ -214,6 +901,12 @@ void displayWeight(float weight, const String& uid) {
     }
     
     display.display();
+}
+
+void showSpoolmanStatus(const String& line1, const String& line2, uint32_t durationMs) {
+    spoolmanDisplayLine1 = line1;
+    spoolmanDisplayLine2 = line2;
+    spoolmanDisplayUntilMs = millis() + durationMs;
 }
 
 // ============================================================================
@@ -265,6 +958,8 @@ void setupWiFi() {
         startMDNS();
     }
     wifiConnected = true;
+    wm.stopWebPortal();
+    wm.stopConfigPortal();
 
     // Check TigerTag cloud health (lightweight)
     cloudOK = checkServerHealth();
@@ -585,8 +1280,27 @@ void setupWebServer() {
             prefs.begin("config", false);
             prefs.putString("apiKey", apiKey);
             prefs.end();
-            
+             
             request->send(200, "application/json", "{\"status\":\"ok\"}");
+        }
+    );
+
+    server.on("/api/spoolman", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<2048> doc;
+            DeserializationError err = deserializeJson(doc, data, len);
+            if (err) {
+                request->send(400, "application/json", String("{\"success\":false,\"error\":\"") + err.c_str() + "\"}");
+                return;
+            }
+
+            spoolmanUrl = normalizeSpoolmanBaseUrl(doc["url"] | "");
+            spoolmanToken = String((const char*)(doc["token"] | ""));
+            spoolmanToken.trim();
+            saveSpoolmanConfig();
+            Serial.printf("[Spoolman] Config saved. url=%s token=%s\n", spoolmanUrl.c_str(), spoolmanToken.length() ? "<set>" : "<empty>");
+
+            request->send(200, "application/json", "{\"success\":true}");
         }
     );
     
@@ -628,6 +1342,8 @@ void setupWebServer() {
         json += "\"apiKey\":\"" + apiKey + "\",";
         json += "\"apiValid\":" + String(apiValid ? "true" : "false") + ",";
         json += "\"displayName\":\"" + apiDisplayName + "\",";
+        json += "\"spoolmanUrl\":\"" + jsonEscape(spoolmanUrl) + "\",";
+        json += "\"spoolmanToken\":\"" + jsonEscape(spoolmanToken) + "\",";
         json += "\"calibrationFactor\":" + String(calibrationFactor, 4) + ",";
         json += "\"uptime_ms\":" + String(millis()) + ","; // milliseconds since boot
         json += "\"uptime_s\":" + String(millis() / 1000) + ",";
@@ -1139,7 +1855,25 @@ String readRFID() {
     lastUIDHex = hexStr;
     String decStr = u64ToDec(decVal);
 
+    TigerTagData tagData;
+    String tagReadError;
+    if (readTigerTagData(tagData, tagReadError)) {
+        lastTigerTagData = tagData;
+        Serial.printf("[TigerTag] Read payload: tigerTagId=%u productId=%u materialId=%u brandId=%u diameterId=%u weight=%u unit=%u\n",
+            (unsigned)tagData.tigerTagId,
+            (unsigned)tagData.productId,
+            (unsigned)tagData.materialId,
+            (unsigned)tagData.brandId,
+            (unsigned)tagData.diameterId,
+            (unsigned)tagData.weightValue,
+            (unsigned)tagData.weightUnitId);
+    } else {
+        lastTigerTagData = TigerTagData();
+        Serial.printf("[TigerTag] Payload read failed for UID %s: %s\n", decStr.c_str(), tagReadError.c_str());
+    }
+
     rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
     return decStr;
 }
 
@@ -1190,6 +1924,8 @@ void setup() {
     apiKey = prefs.getString("apiKey", "");
     calibrationFactor = prefs.getFloat("calFactor", calibrationFactor);
     apiDisplayName = prefs.getString("apiName", "");
+    spoolmanUrl = normalizeSpoolmanBaseUrl(prefs.getString("spoolmanUrl", ""));
+    spoolmanToken = prefs.getString("spoolmanToken", "");
     prefs.end();
     
     WiFi.onEvent(onWiFiEvent);
@@ -1235,10 +1971,28 @@ void loop() {
     String uid = readRFID();
     if (uid.length() > 0 && uid != lastUID) {
         lastUID = uid;
+        spoolmanSyncPending = true;
         Serial.println("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
     }
     
     float weight = readWeight();
+    currentWeight = weight;
+
+    if (spoolmanSyncPending && lastUID.length() > 0) {
+        String spoolmanError;
+        Serial.printf("[Spoolman] Starting sync for UID %s at weight %.2f g\n", lastUID.c_str(), weight);
+        const bool spoolmanOk = syncWeightToSpoolman(lastUID, weight, spoolmanError);
+        if (spoolmanOk) {
+            Serial.printf("[Spoolman] Sync success for UID %s\n", lastUID.c_str());
+            showSpoolmanStatus("Spoolman OK", "Weight synced");
+        } else {
+            Serial.printf("[Spoolman] Sync failed for UID %s: %s\n", lastUID.c_str(), spoolmanError.c_str());
+            String shortErr = spoolmanError;
+            if (shortErr.length() > 18) shortErr = shortErr.substring(0, 18);
+            showSpoolmanStatus("Spoolman ERR", shortErr, 2500);
+        }
+        spoolmanSyncPending = false;
+    }
 
     // --- Hold mode logic ---
     float displayedWeight = weight;

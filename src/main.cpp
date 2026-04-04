@@ -137,6 +137,8 @@ bool spoolmanSyncPending = false;
 String spoolmanDisplayLine1 = "";
 String spoolmanDisplayLine2 = "";
 uint32_t spoolmanDisplayUntilMs = 0;
+String autoPushUid = "";
+uint8_t autoPushAttempts = 0;
 
 struct TigerTagData {
     bool valid = false;
@@ -152,6 +154,14 @@ struct TigerTagData {
     uint8_t colorG = 0;
     uint8_t colorB = 0;
     uint8_t colorA = 0;
+    uint8_t color2R = 0;
+    uint8_t color2G = 0;
+    uint8_t color2B = 0;
+    uint8_t color2A = 0;
+    uint8_t color3R = 0;
+    uint8_t color3G = 0;
+    uint8_t color3B = 0;
+    uint8_t color3A = 0;
     uint32_t weightValue = 0;
     uint8_t weightUnitId = 0;
     uint16_t tempMin = 0;
@@ -178,6 +188,7 @@ TigerTagData lastTigerTagData;
 struct TigerTagResolvedMeta {
     String brandName;
     String materialName;
+    String aspect1Name;
 };
 
 // ============================================================================
@@ -190,6 +201,7 @@ void displayMessage(String line1, String line2 = "", String line3 = "", String l
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
+    display.setTextWrap(false);
 
     display.setCursor(0, 0);
     display.println(line1);
@@ -217,7 +229,7 @@ void displayMessage(String line1, String line2 = "", String line3 = "", String l
 void displayWeight(float weight, const String& uid = "");
 
 bool checkServerHealth();
-bool pushWeightToCloud(float w);
+bool pushWeightToCloud(float w, int& codeOut, String& respOut);
 void handleAutoPush(float w);
 bool validateApiKeyFirmware(const String& key, String& displayNameOut);
 bool deleteApiKey();
@@ -233,6 +245,36 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
 String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut);
 bool syncWeightToSpoolman(const String& uid, float w, String& errorOut);
 void saveSpoolmanConfig();
+void resetAutoPushState(bool clearUid);
+
+static uint8_t chooseTextSizeForWidth(const String& text, uint8_t preferredSize, uint8_t minSize = 1) {
+    int16_t x1 = 0, y1 = 0;
+    uint16_t w = 0, h = 0;
+    for (int size = preferredSize; size >= (int)minSize; --size) {
+        display.setTextSize(size);
+        display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+        if (w <= OLED_WIDTH) {
+            return (uint8_t)size;
+        }
+    }
+    return minSize;
+}
+
+static void prepareSpoolmanHttp(HTTPClient& http) {
+    http.setConnectTimeout(3000);
+    http.setTimeout(5000);
+}
+
+static String formatHttpFailure(int code, const String& resp) {
+    String message = String("HTTP ") + code;
+    if (code < 0) {
+        message += " (" + HTTPClient::errorToString(code) + ")";
+    }
+    if (resp.length() > 0) {
+        message += ": " + resp;
+    }
+    return message;
+}
 
 static String jsonEscape(const String& input) {
     String out;
@@ -277,6 +319,109 @@ static String colorToHex(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     char buf[9];
     snprintf(buf, sizeof(buf), "%02X%02X%02X%02X", r, g, b, a);
     return String(buf);
+}
+
+static String colorRgbToHex(uint8_t r, uint8_t g, uint8_t b) {
+    char buf[7];
+    snprintf(buf, sizeof(buf), "%02X%02X%02X", r, g, b);
+    return String(buf);
+}
+
+struct NamedColor {
+    const char* name;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
+
+static String nearestColorName(uint8_t r, uint8_t g, uint8_t b) {
+    static const NamedColor palette[] = {
+        {"Black", 0x16, 0x16, 0x16},
+        {"White", 0xF5, 0xF5, 0xF5},
+        {"Red", 0xF4, 0x43, 0x36},
+        {"Blue", 0x21, 0x96, 0xF3},
+        {"Green", 0x4C, 0xAF, 0x50},
+        {"Yellow", 0xFF, 0xEB, 0x3B},
+        {"Orange", 0xFF, 0x98, 0x00},
+        {"Purple", 0x9C, 0x27, 0xB0},
+        {"Pink", 0xE9, 0x1E, 0x63},
+        {"Brown", 0x79, 0x55, 0x48},
+        {"Gray", 0x9E, 0x9E, 0x9E},
+        {"Silver", 0xC0, 0xC0, 0xC0}
+    };
+
+    uint32_t bestDistance = 0xFFFFFFFFu;
+    const char* bestName = "Color";
+    for (const NamedColor& candidate : palette) {
+        const int dr = (int)r - candidate.r;
+        const int dg = (int)g - candidate.g;
+        const int db = (int)b - candidate.b;
+        const uint32_t distance = (uint32_t)(dr * dr + dg * dg + db * db);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestName = candidate.name;
+        }
+    }
+    return String(bestName);
+}
+
+static bool hasMeaningfulRgb(uint8_t r, uint8_t g, uint8_t b) {
+    return !(r == 0 && g == 0 && b == 0);
+}
+
+static void appendUniqueColorName(String& list, const String& colorName) {
+    if (!colorName.length()) return;
+    if (list.length() == 0) {
+        list = colorName;
+        return;
+    }
+
+    int start = 0;
+    while (start < list.length()) {
+        int sep = list.indexOf('/', start);
+        if (sep < 0) sep = list.length();
+        if (list.substring(start, sep) == colorName) return;
+        start = sep + 1;
+    }
+
+    list += "/";
+    list += colorName;
+}
+
+static String buildFilamentNameFromTag(const TigerTagData& tagData, const String& materialName) {
+    String primaryColor = nearestColorName(tagData.colorR, tagData.colorG, tagData.colorB);
+    String secondaryColor = nearestColorName(tagData.color2R, tagData.color2G, tagData.color2B);
+    String tertiaryColor = nearestColorName(tagData.color3R, tagData.color3G, tagData.color3B);
+    String name;
+
+    appendUniqueColorName(name, primaryColor);
+    if (hasMeaningfulRgb(tagData.color2R, tagData.color2G, tagData.color2B)) {
+        appendUniqueColorName(name, secondaryColor);
+    }
+    if (hasMeaningfulRgb(tagData.color3R, tagData.color3G, tagData.color3B)) {
+        appendUniqueColorName(name, tertiaryColor);
+    }
+
+    if (materialName.length() > 0) {
+        name += " " + materialName;
+    }
+    return name;
+}
+
+static String decodeSpoolmanExtraValue(const JsonVariantConst& value) {
+    if (value.is<const char*>()) {
+        String raw = String((const char*)value);
+        if (raw.length() >= 2 && raw[0] == '"' && raw[raw.length() - 1] == '"') {
+            DynamicJsonDocument doc(256);
+            if (deserializeJson(doc, raw) == DeserializationError::Ok && doc.is<const char*>()) {
+                return String((const char*)doc.as<const char*>());
+            }
+        }
+        return raw;
+    }
+    if (value.is<long>() || value.is<int>()) return String(value.as<int>());
+    if (value.is<unsigned long>() || value.is<unsigned int>()) return String(value.as<unsigned int>());
+    return "";
 }
 
 static float inferDensityFromMaterialName(const String& materialName) {
@@ -357,6 +502,14 @@ static bool readTigerTagData(TigerTagData& dataOut, String& errorOut) {
     data.colorG = page8[1];
     data.colorB = page8[2];
     data.colorA = page8[3];
+    data.color2R = page12[4];
+    data.color2G = page12[5];
+    data.color2B = page12[6];
+    data.color2A = page12[7];
+    data.color3R = page12[8];
+    data.color3G = page12[9];
+    data.color3B = page12[10];
+    data.color3A = page12[11];
     data.weightValue = ((uint32_t)page8[4] << 16) | ((uint32_t)page8[5] << 8) | (uint32_t)page8[6];
     data.weightUnitId = page8[7];
     data.tempMin = readU16BE(&page8[8]);
@@ -466,13 +619,19 @@ bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta
     String err;
     String brandUrl = String("https://api.tigertag.io/api:tigertag/brand/get?id=") + String(tagData.brandId);
     String materialUrl = String("https://api.tigertag.io/api:tigertag/material/filament/get?id=") + String(tagData.materialId) + "&lang=en";
+    String aspectUrl = String("https://api.tigertag.io/api:tigertag/aspect/get?id=") + String(tagData.aspect1Id);
 
     fetchTigerTagSimpleName(brandUrl, "name", metaOut.brandName, err);
     if (!err.isEmpty()) Serial.printf("[TigerTag] Brand lookup failed for %u: %s\n", (unsigned)tagData.brandId, err.c_str());
     err = "";
     fetchTigerTagSimpleName(materialUrl, "label", metaOut.materialName, err);
     if (!err.isEmpty()) Serial.printf("[TigerTag] Material lookup failed for %u: %s\n", (unsigned)tagData.materialId, err.c_str());
-    return metaOut.brandName.length() > 0 || metaOut.materialName.length() > 0;
+    err = "";
+    if (tagData.aspect1Id != 0 && tagData.aspect1Id != 0xFF) {
+        fetchTigerTagSimpleName(aspectUrl, "name", metaOut.aspect1Name, err);
+        if (!err.isEmpty()) Serial.printf("[TigerTag] Aspect lookup failed for %u: %s\n", (unsigned)tagData.aspect1Id, err.c_str());
+    }
+    return metaOut.brandName.length() > 0 || metaOut.materialName.length() > 0 || metaOut.aspect1Name.length() > 0;
 }
 
 String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut) {
@@ -556,8 +715,7 @@ String findSpoolmanFilamentIdByExternalId(const String& externalId, String& erro
     }
 
     HTTPClient http;
-    String url = baseUrl + "/api/v1/filament?external_id=" + externalId;
-    url = baseUrl + "/api/v1/filament?external_id=" + urlEncode(externalId);
+    String url = baseUrl + "/api/v1/filament?external_id=" + urlEncode(String("\"") + externalId + "\"");
     Serial.printf("[Spoolman] Lookup filament via %s\n", url.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
@@ -613,24 +771,27 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
     }
     if (errorOut.length() > 0) return "";
 
-    String filamentName = hasProductInfo && productInfo.name.length()
-        ? productInfo.name
-        : (hasValidProductId ? (String("TigerTag Product ") + String(tagData.productId)) : (String("TigerTag UID ") + uid));
     String materialName = hasProductInfo && productInfo.material.length() ? productInfo.material : String("Material ") + String(tagData.materialId);
     String brandName = hasProductInfo && productInfo.brand.length() ? productInfo.brand : "";
+    String aspect1Name = "";
     if (!hasProductInfo || !brandName.length() || materialName.startsWith("Material ")) {
         TigerTagResolvedMeta resolvedMeta;
         String metaErr;
         if (fetchTigerTagResolvedMeta(tagData, resolvedMeta, metaErr)) {
             if (!brandName.length() && resolvedMeta.brandName.length()) brandName = resolvedMeta.brandName;
             if (materialName.startsWith("Material ") && resolvedMeta.materialName.length()) materialName = resolvedMeta.materialName;
+            aspect1Name = resolvedMeta.aspect1Name;
         }
     }
-    if (!hasProductInfo) {
-        if (brandName.length() && materialName.length()) filamentName = brandName + " " + materialName;
-        else if (materialName.length()) filamentName = materialName;
-    }
+    String filamentName = buildFilamentNameFromTag(tagData, materialName);
     String colorHex = hasProductInfo && productInfo.colorHex.length() ? productInfo.colorHex : colorToHex(tagData.colorR, tagData.colorG, tagData.colorB, tagData.colorA);
+    String primaryRgbHex = colorRgbToHex(tagData.colorR, tagData.colorG, tagData.colorB);
+    String secondaryRgbHex = colorRgbToHex(tagData.color2R, tagData.color2G, tagData.color2B);
+    String tertiaryRgbHex = colorRgbToHex(tagData.color3R, tagData.color3G, tagData.color3B);
+    bool hasSecondColor = hasMeaningfulRgb(tagData.color2R, tagData.color2G, tagData.color2B) && secondaryRgbHex != primaryRgbHex;
+    bool hasThirdColor = hasMeaningfulRgb(tagData.color3R, tagData.color3G, tagData.color3B) &&
+        tertiaryRgbHex != primaryRgbHex &&
+        tertiaryRgbHex != secondaryRgbHex;
     float diameter = !isnan(productInfo.diameterMm) ? productInfo.diameterMm : (tagData.diameterId == 56 ? 1.75f : (tagData.diameterId == 221 ? 2.85f : NAN));
     float netWeight = !isnan(productInfo.netWeightG) ? productInfo.netWeightG : (tagData.weightValue > 0 ? (float)tagData.weightValue : NAN);
     float density = inferDensityFromMaterialName(materialName);
@@ -646,8 +807,17 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
     payload["name"] = filamentName;
     payload["material"] = materialName;
     payload["external_id"] = externalId;
+    if (aspect1Name.length()) payload["comment"] = aspect1Name;
     if (vendorId.length()) payload["vendor_id"] = vendorId.toInt();
-    payload["color_hex"] = colorHex;
+    if (hasSecondColor || hasThirdColor) {
+        String multiColors = primaryRgbHex;
+        if (hasSecondColor) multiColors += "," + secondaryRgbHex;
+        if (hasThirdColor) multiColors += "," + tertiaryRgbHex;
+        payload["multi_color_hexes"] = multiColors;
+        payload["multi_color_direction"] = "longitudinal";
+    } else {
+        payload["color_hex"] = colorHex;
+    }
     payload["density"] = density;
     if (!isnan(diameter)) payload["diameter"] = diameter;
     if (!isnan(netWeight) && netWeight > 0) payload["weight"] = netWeight;
@@ -749,6 +919,7 @@ String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
     HTTPClient http;
     const String url = baseUrl + "/api/v1/spool";
     Serial.printf("[Spoolman] Lookup UID %s via %s\n", uid.c_str(), url.c_str());
+    prepareSpoolmanHttp(http);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
@@ -762,18 +933,19 @@ String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
     if (code < 200 || code >= 300) {
         const String resp = http.getString();
         http.end();
-        errorOut = String("HTTP ") + code;
-        if (resp.length() > 0) errorOut += ": " + resp;
+        errorOut = formatHttpFailure(code, resp);
         return "";
     }
 
+    const String resp = http.getString();
+    http.end();
+
     DynamicJsonDocument filter(256);
     filter[0]["id"] = true;
-    filter[0]["extra_rfid_uid"] = true;
+    filter[0]["extra"]["rfid_uid"] = true;
 
-    DynamicJsonDocument doc(24576);
-    DeserializationError err = deserializeJson(doc, *http.getStreamPtr(), DeserializationOption::Filter(filter));
-    http.end();
+    DynamicJsonDocument doc(32768);
+    DeserializationError err = deserializeJson(doc, resp, DeserializationOption::Filter(filter));
     if (err) {
         errorOut = String("json parse failed: ") + err.c_str();
         return "";
@@ -782,8 +954,7 @@ String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
     JsonArray spools = doc.as<JsonArray>();
     Serial.printf("[Spoolman] Lookup response contains %u spool entries\n", (unsigned)spools.size());
     for (JsonObject spool : spools) {
-        const char* extraUidRaw = spool["extra_rfid_uid"] | "";
-        String extraUid = String(extraUidRaw);
+        String extraUid = decodeSpoolmanExtraValue(spool["extra"]["rfid_uid"]);
         extraUid.trim();
         if (extraUid == uid) {
             String spoolId = String((int)spool["id"]);
@@ -827,6 +998,7 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
 
     HTTPClient http;
     const String url = baseUrl + "/api/v1/spool/" + resolvedSpoolId;
+    prepareSpoolmanHttp(http);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return false;
@@ -847,8 +1019,7 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
 
     if (code >= 200 && code < 300) return true;
 
-    errorOut = String("HTTP ") + code;
-    if (resp.length() > 0) errorOut += ": " + resp;
+    errorOut = formatHttpFailure(code, resp);
     return false;
 }
 
@@ -856,6 +1027,8 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
 //    Shows WiFi status, weight (large digits), UID, and device IP.
 void displayWeight(float weight, const String& uid) {
     display.clearDisplay();
+    const bool showingStatus = spoolmanDisplayUntilMs > millis() && spoolmanDisplayLine1.length() > 0;
+    display.setTextWrap(false);
     
      // En-tête avec titre et statut WiFi
     display.setTextSize(1);
@@ -867,25 +1040,29 @@ void displayWeight(float weight, const String& uid) {
     display.println(wifiConnected ? "WiFi" : "----");
 
     // Hold mode indicator (🅗 at x=112, y=0)
-    if (holdMode) { display.setCursor(112, 0); display.print("🅗"); }
+    if (holdMode) { display.setCursor(120, 0); display.print("H"); }
     
     // Poids au centre (grande taille) — entier uniquement
+    if (showingStatus) {
+        display.setTextSize(chooseTextSizeForWidth(spoolmanDisplayLine1, 2, 1));
+        display.setCursor(0, 20);
+        display.println(spoolmanDisplayLine1);
+        if (spoolmanDisplayLine2.length() > 0) {
+            display.setTextSize(1);
+            display.setCursor(0, 46);
+            display.println(spoolmanDisplayLine2);
+        }
+        display.display();
+        return;
+    }
+
     int wInt = (int)(weight + (weight >= 0 ? 0.5f : -0.5f));
     display.setTextSize(2);
     display.setCursor(0, 20);
     display.print(wInt);
     display.println(" g");
     
-    // UID or transient Spoolman status
-    if (spoolmanDisplayUntilMs > millis() && spoolmanDisplayLine1.length() > 0) {
-        display.setTextSize(1);
-        display.setCursor(0, 40);
-        display.println(spoolmanDisplayLine1);
-        if (spoolmanDisplayLine2.length() > 0) {
-            display.setCursor(0, 49);
-            display.println(spoolmanDisplayLine2);
-        }
-    } else if (uid.length() > 0) {
+    if (uid.length() > 0) {
         display.setTextSize(1);
         display.setCursor(0, 45);
         display.print("UID:");
@@ -909,6 +1086,18 @@ void showSpoolmanStatus(const String& line1, const String& line2, uint32_t durat
     spoolmanDisplayUntilMs = millis() + durationMs;
 }
 
+void resetAutoPushState(bool clearUid) {
+    sendPhase = "";
+    sendCountdown = -1;
+    stableSinceMs = 0;
+    stableCandidate = NAN;
+    autoPushAttempts = 0;
+    autoPushUid = "";
+    if (clearUid) {
+        lastUID = "";
+    }
+}
+
 // ============================================================================
 // PORTAIL CAPTIF & CONFIGURATION
 // ============================================================================
@@ -922,7 +1111,7 @@ void configModeCallback(WiFiManager *myWiFiManager) {
 }
 
 void saveConfigCallback() {
-    displayMessage("Saving...", "Wi‑Fi config OK", "Reconnecting...");
+    displayMessage("Saving...", "WiFi config OK", "Reconnecting...");
     delay(800);
 }
 
@@ -941,11 +1130,33 @@ void setupWiFi() {
     gSetupSsid = makeSetupSSID();
     gMdnsName = String("tigerscale-") + macSuffix4();
     WiFi.setHostname(gMdnsName.c_str());
-    
-    if (!wm.autoConnect(gSetupSsid.c_str())) {
-        displayMessage("WiFi ERROR", "Restarting...");
-        delay(3000);
-        ESP.restart();
+
+    WiFi.mode(WIFI_STA);
+    bool connected = false;
+    for (int attempt = 1; attempt <= 2 && !connected; ++attempt) {
+        displayMessage("Connecting WiFi", String("Try ") + attempt + "/2");
+        WiFi.disconnect(false, false);
+        delay(250);
+        WiFi.begin();
+
+        const uint32_t attemptStart = millis();
+        while (millis() - attemptStart < 10000) {
+            if (WiFi.status() == WL_CONNECTED) {
+                connected = true;
+                break;
+            }
+            delay(250);
+        }
+    }
+
+    if (!connected) {
+        displayMessage("WiFi failed", "Starting AP");
+        delay(1200);
+        if (!wm.startConfigPortal(gSetupSsid.c_str())) {
+            displayMessage("AP timeout", "Restarting...");
+            delay(3000);
+            ESP.restart();
+        }
     }
     
     apiKey = custom_api_key.getValue();
@@ -1515,7 +1726,7 @@ void setupWebServer() {
 
             if (code >= 200 && code < 300) {
                 currentWeight = (float)wi;
-                displayMessage("Synced \xE2\x9C\x93", String(wi) + " g", "to cloud");
+                displayMessage("Synced OK", String(wi) + " g", "to cloud");
                 delay(700);
                 lastUID = "";
                 lastPushedWeight = NAN;
@@ -1560,7 +1771,7 @@ void setupWebServer() {
 
             if (code >= 200 && code < 300) {
                 currentWeight = (float)wi;
-                displayMessage("Synced \xE2\x9C\x93", String(wi) + " g", "to cloud");
+                displayMessage("Synced OK", String(wi) + " g", "to cloud");
                 delay(700);
                 lastUID = "";
                 lastPushedWeight = NAN;
@@ -1621,7 +1832,9 @@ void setupWebServer() {
 }
 
 // Helper: push weight to TigerTag Cloud Function
-bool pushWeightToCloud(float w) {
+bool pushWeightToCloud(float w, int& codeOut, String& respOut) {
+    codeOut = 0;
+    respOut = "";
     if (!wifiConnected || !WiFi.isConnected()) return false;
     if (apiKey.length() == 0 || lastUID.length() == 0) return false;
 
@@ -1632,13 +1845,13 @@ bool pushWeightToCloud(float w) {
     http.addHeader("x-api-key", apiKey);
     int wInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
     String payload = String("{\"uid\":\"") + lastUID + "\",\"weight\":" + String(wInt) + "}";
-    int code = http.POST(payload);
-    String resp = http.getString();
+    codeOut = http.POST(payload);
+    respOut = http.getString();
     http.end();
-    if (code >= 200 && code < 300) {
+    if (codeOut >= 200 && codeOut < 300) {
         return true;
     }
-    Serial.printf("[AutoPush] Upstream error %d: %s\n", code, resp.c_str());
+    Serial.printf("[AutoPush] Upstream error %d: %s\n", codeOut, respOut.c_str());
     return false;
 }
 
@@ -1652,11 +1865,22 @@ void handleAutoPush(float w) {
     }
 
     // Preconditions to consider any auto-send
-    if (w < MIN_WEIGHT_TO_SEND_G || apiKey.length() == 0 || lastUID.length() == 0 || !WiFi.isConnected()) {
-        sendPhase = "";            // idle
-        sendCountdown = -1;
-        stableSinceMs = 0;
-        stableCandidate = NAN;
+    if (w < MIN_WEIGHT_TO_SEND_G) {
+        resetAutoPushState(true);
+        return;
+    }
+    if (apiKey.length() == 0 || lastUID.length() == 0 || !WiFi.isConnected()) {
+        resetAutoPushState(false);
+        return;
+    }
+
+    if (autoPushUid != lastUID) {
+        autoPushUid = lastUID;
+        autoPushAttempts = 0;
+    }
+
+    if (autoPushAttempts >= 2) {
+        resetAutoPushState(true);
         return;
     }
 
@@ -1700,17 +1924,18 @@ void handleAutoPush(float w) {
     sendCountdown = 0;
 
     displayMessage("Sending...", String("UID ") + lastUID, String(w, 1) + " g");
-    bool ok = pushWeightToCloud(w);
+    int pushCode = 0;
+    String pushResp;
+    autoPushAttempts++;
+    bool ok = pushWeightToCloud(w, pushCode, pushResp);
     if (ok) {
         int wInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
         lastPushedWeight = w;
         lastPushMs = now;
-        displayMessage("Synced \xE2\x9C\x93", String(wInt) + " g", "to cloud");
+        displayMessage("Synced OK", String(wInt) + " g", "to cloud");
         delay(700);
-        lastUID = "";
+        resetAutoPushState(true);
         lastPushedWeight = NAN;
-        stableSinceMs = 0;
-        stableCandidate = NAN;
         char buf[64];
         snprintf(buf, sizeof(buf), "{\"weight\":%d,\"uid\":\"%s\"}", wInt, lastUID.c_str());
         ws.textAll(buf);
@@ -1719,8 +1944,11 @@ void handleAutoPush(float w) {
         sendPhaseLastChangeMs = millis();
         sendCountdown = -1;
     } else {
-        displayMessage("Sync failed", "Check Wi‑Fi/API", String(w, 1) + " g");
+        displayMessage("Sync failed", "Check WiFi/API", String(w, 1) + " g");
         delay(700);
+        if (pushCode == 404 || autoPushAttempts >= 2) {
+            resetAutoPushState(true);
+        }
         displayWeight(w, lastUID);
         sendPhase = "error";
         sendPhaseLastChangeMs = millis();
@@ -1918,7 +2146,7 @@ void setup() {
     }
     
     displayMessage("TigerTagScale", "Starting...", "v1.1.0");
-    delay(2000);
+    delay(2500);
     
     prefs.begin("config", true);
     apiKey = prefs.getString("apiKey", "");
@@ -1972,6 +2200,8 @@ void loop() {
     if (uid.length() > 0 && uid != lastUID) {
         lastUID = uid;
         spoolmanSyncPending = true;
+        showSpoolmanStatus("Reading", "Please wait", 6000);
+        displayWeight(currentWeight, lastUID);
         Serial.println("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
     }
     
@@ -1980,6 +2210,8 @@ void loop() {
 
     if (spoolmanSyncPending && lastUID.length() > 0) {
         String spoolmanError;
+        showSpoolmanStatus("Reading", "Processing...", 6000);
+        displayWeight(currentWeight, lastUID);
         Serial.printf("[Spoolman] Starting sync for UID %s at weight %.2f g\n", lastUID.c_str(), weight);
         const bool spoolmanOk = syncWeightToSpoolman(lastUID, weight, spoolmanError);
         if (spoolmanOk) {

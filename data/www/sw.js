@@ -1,10 +1,12 @@
-const CACHE_NAME = 'tigertag-scale-v1';
+const CACHE_NAME = 'tigertag-scale-v3';
 const urlsToCache = [
   '/',
   '/index.html',
-  '/favicon.png',
-  '/favicon.ico',
-  '/manifest.json'
+  '/favicon.png?v=3',
+  '/favicon.ico?v=3',
+  '/manifest.json',
+  '/styles.css?v=2',
+  '/script.js?v=2'
 ];
 
 // Install Service Worker

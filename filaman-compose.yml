@@ -1,0 +1,25 @@
+services:
+  filaman:
+    image: ghcr.io/fire-devils/filaman-system:latest
+    container_name: filaman
+    restart: unless-stopped
+    ports:
+      - "8083:8000"
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/filaman.db
+      SECRET_KEY: change-me-with-a-random-64-char-hex-string
+      CSRF_SECRET_KEY: change-me-with-a-random-64-char-hex-string
+      DEBUG: "false"
+      CORS_ORIGINS: "*"
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: admin123
+      ADMIN_DISPLAY_NAME: Admin
+      ADMIN_LANGUAGE: en
+      ADMIN_SUPERADMIN: "true"
+      LOG_LEVEL: INFO
+      LOG_FORMAT: text
+      OIDC_ENC_KEY: ""
+    volumes:
+      - filaman_data:/app/data
+volumes:
+  filaman_data:

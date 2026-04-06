@@ -223,8 +223,15 @@ let calFactor = null;
 let apiKey = '';
 let cloudStatus = 'unknown';
 let apiStatus = 'none';
+let spoolmanEnabled = false;
 let spoolmanUrl = '';
 let spoolmanToken = '';
+let spoolmanUsername = '';
+let spoolmanPassword = '';
+let filamanEnabled = false;
+let filamanUrl = '';
+let filamanToken = '';
+let integrationSettingsLoaded = false;
 
 // ========== UTILITIES ==========
 function setTextIfChanged(el, txt) {
@@ -237,6 +244,29 @@ function setInputIfIdle(id, value) {
     if (!el) return;
     if (document.activeElement === el) return;
     if (el.value !== value) el.value = value;
+}
+
+function setCheckboxValue(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.checked !== value) el.checked = value;
+}
+
+function bindIntegrationHydrationGuards() {
+    const fieldIds = [
+        'spoolmanEnabled', 'spoolmanUrl', 'spoolmanToken', 'spoolmanUsername', 'spoolmanPassword',
+        'filamanEnabled', 'filamanUrl', 'filamanToken'
+    ];
+
+    fieldIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el || el.dataset.hydrationGuardBound) return;
+        const eventName = el.type === 'checkbox' ? 'change' : 'input';
+        el.addEventListener(eventName, () => {
+            integrationSettingsLoaded = true;
+        });
+        el.dataset.hydrationGuardBound = 'true';
+    });
 }
 
 function toggleSection(el) {
@@ -395,12 +425,18 @@ function deleteApiKey() {
 }
 
 function saveSpoolmanConfig() {
+    const enabledInput = document.getElementById('spoolmanEnabled');
     const urlInput = document.getElementById('spoolmanUrl');
     const tokenInput = document.getElementById('spoolmanToken');
+    const usernameInput = document.getElementById('spoolmanUsername');
+    const passwordInput = document.getElementById('spoolmanPassword');
     const btn = document.querySelector('button[onclick="saveSpoolmanConfig()"]');
     const payload = {
+        enabled: !!(enabledInput && enabledInput.checked),
         url: (urlInput && urlInput.value ? urlInput.value : '').trim(),
-        token: (tokenInput && tokenInput.value ? tokenInput.value : '').trim()
+        token: (tokenInput && tokenInput.value ? tokenInput.value : '').trim(),
+        username: (usernameInput && usernameInput.value ? usernameInput.value : '').trim(),
+        password: (passwordInput && passwordInput.value ? passwordInput.value : '').trim()
     };
 
     if (btn) {
@@ -416,14 +452,100 @@ function saveSpoolmanConfig() {
     .then(r => r.ok ? r.json() : Promise.reject(r.status))
     .then(res => {
         if (!res.success) throw new Error('save failed');
+        spoolmanEnabled = payload.enabled;
         spoolmanUrl = payload.url;
         spoolmanToken = payload.token;
+        spoolmanUsername = payload.username;
+        spoolmanPassword = payload.password;
     })
     .catch(() => alert('Error saving Spoolman settings'))
     .finally(() => {
         if (btn) {
             btn.disabled = false;
             btn.textContent = 'Save Spoolman';
+        }
+    });
+}
+
+function saveFilamanConfig() {
+    const enabledInput = document.getElementById('filamanEnabled');
+    const urlInput = document.getElementById('filamanUrl');
+    const tokenInput = document.getElementById('filamanToken');
+    const btn = document.querySelector('button[onclick="saveFilamanConfig()"]');
+    const payload = {
+        enabled: !!(enabledInput && enabledInput.checked),
+        url: (urlInput && urlInput.value ? urlInput.value : '').trim(),
+        token: (tokenInput && tokenInput.value ? tokenInput.value : '').trim()
+    };
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
+
+    fetch('/api/filaman', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(res => {
+        if (!res.success) throw new Error('save failed');
+        filamanEnabled = payload.enabled;
+        filamanUrl = payload.url;
+        filamanToken = payload.token;
+    })
+    .catch(() => alert('Error saving Filaman settings'))
+    .finally(() => {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save Filaman';
+        }
+    });
+}
+
+function uploadOtaImage(target) {
+    const isFilesystem = target === 'filesystem';
+    const input = document.getElementById(isFilesystem ? 'otaFilesystemFile' : 'otaFirmwareFile');
+    const statusEl = document.getElementById('otaStatus');
+    const btn = document.querySelector(`button[onclick="uploadOtaImage('${target}')"]`);
+    const file = input && input.files ? input.files[0] : null;
+
+    if (!file) {
+        alert('Select a .bin file first.');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+
+    if (statusEl) {
+        statusEl.classList.remove('hidden');
+        statusEl.textContent = `Uploading ${isFilesystem ? 'filesystem' : 'firmware'}...`;
+    }
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Uploading...';
+    }
+
+    fetch(isFilesystem ? '/api/ota/filesystem' : '/api/ota/firmware', {
+        method: 'POST',
+        body: formData
+    })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(res => {
+        if (!res.success) throw new Error('upload failed');
+        if (statusEl) statusEl.textContent = 'Upload complete. Device restarting...';
+        if (input) input.value = '';
+    })
+    .catch(() => {
+        if (statusEl) statusEl.textContent = 'OTA upload failed.';
+        alert('OTA upload failed');
+    })
+    .finally(() => {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = isFilesystem ? 'Upload Filesystem OTA' : 'Upload Firmware OTA';
         }
     });
 }
@@ -853,15 +975,6 @@ function applyStatusSnapshot(s) {
         setApiStatus(state, s.displayName || '');
     }
 
-    if (typeof s.spoolmanUrl === 'string') {
-        spoolmanUrl = s.spoolmanUrl;
-        setInputIfIdle('spoolmanUrl', spoolmanUrl);
-    }
-    if (typeof s.spoolmanToken === 'string') {
-        spoolmanToken = s.spoolmanToken;
-        setInputIfIdle('spoolmanToken', spoolmanToken);
-    }
-    
     // Calibration factor
     if (typeof s.calibrationFactor !== 'undefined') {
         const n = Number(s.calibrationFactor);
@@ -903,6 +1016,49 @@ function pollStatus() {
     .catch(() => {});
 }
 
+function loadIntegrationSettings() {
+    fetch('/api/integrations', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(s => {
+        if (integrationSettingsLoaded || !s || typeof s !== 'object') return;
+
+        if (typeof s.spoolmanEnabled !== 'undefined') {
+            spoolmanEnabled = !!s.spoolmanEnabled;
+            setCheckboxValue('spoolmanEnabled', spoolmanEnabled);
+        }
+        if (typeof s.spoolmanUrl === 'string') {
+            spoolmanUrl = s.spoolmanUrl;
+            setInputIfIdle('spoolmanUrl', spoolmanUrl);
+        }
+        if (typeof s.spoolmanToken === 'string') {
+            spoolmanToken = s.spoolmanToken;
+            setInputIfIdle('spoolmanToken', spoolmanToken);
+        }
+        if (typeof s.spoolmanUsername === 'string') {
+            spoolmanUsername = s.spoolmanUsername;
+            setInputIfIdle('spoolmanUsername', spoolmanUsername);
+        }
+        if (typeof s.spoolmanPassword === 'string') {
+            spoolmanPassword = s.spoolmanPassword;
+            setInputIfIdle('spoolmanPassword', spoolmanPassword);
+        }
+        if (typeof s.filamanEnabled !== 'undefined') {
+            filamanEnabled = !!s.filamanEnabled;
+            setCheckboxValue('filamanEnabled', filamanEnabled);
+        }
+        if (typeof s.filamanUrl === 'string') {
+            filamanUrl = s.filamanUrl;
+            setInputIfIdle('filamanUrl', filamanUrl);
+        }
+        if (typeof s.filamanToken === 'string') {
+            filamanToken = s.filamanToken;
+            setInputIfIdle('filamanToken', filamanToken);
+        }
+        integrationSettingsLoaded = true;
+    })
+    .catch(() => {});
+}
+
 // ========== INITIALIZATION ==========
 window.onload = () => {
     // Set language
@@ -910,6 +1066,10 @@ window.onload = () => {
     
     // Initial weight display
     setTextIfChanged(weightEl, '…');
+
+    // Once the user touches the integration form, never hydrate it again from polling.
+    bindIntegrationHydrationGuards();
+    loadIntegrationSettings();
     
     // Start polling
     pollStatus();
@@ -917,7 +1077,7 @@ window.onload = () => {
     
     // Register Service Worker for PWA
     if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/sw.js')
+        navigator.serviceWorker.register('/sw.js?v=2')
             .then(reg => console.log('Service Worker registered'))
             .catch(err => console.log('Service Worker registration failed'));
     }

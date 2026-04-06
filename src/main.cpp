@@ -20,6 +20,8 @@
 #include <MFRC522.h>
 #include <SPI.h>
 #include <LittleFS.h>  // ← AJOUTÉ pour filesystem
+#include <Update.h>
+#include <esp_wifi.h>
 #include <math.h>
 
 // ============================================================================
@@ -88,8 +90,18 @@ String apiKey = "";
 String apiDisplayName = "";     // cached display name for validated API key
 bool apiValid = false;          // last known validation state
 uint32_t lastApiBroadcastMs = 0; // WS broadcast throttle for apiStatus
-String spoolmanUrl = "";
-String spoolmanToken = "";
+struct IntegrationConfig {
+    const char* name;
+    const char* apiPath;
+    bool enabled;
+    String url;
+    String token;
+    String username;
+    String password;
+};
+
+IntegrationConfig spoolmanConfig = {"Spoolman", "/api/v1", false, "", "", "", ""};
+IntegrationConfig filamanConfig = {"Filaman", "/api/v1", false, "", "", "", ""};
 float calibrationFactor = 406;
 float currentWeight = 0.0;
 // --- Hold mode variables ---
@@ -104,6 +116,14 @@ String lastUIDHex = "";    // hex UID for logs/debug
 
 bool wifiConnected = false;
 bool cloudOK = false; // true if health endpoint returns {"ok":true}
+bool wifiPortalDeferred = false;
+bool wifiPortalActive = false;
+uint32_t wifiPortalFallbackAtMs = 0;
+const uint32_t WIFI_PORTAL_FALLBACK_DELAY_MS = 120000;
+uint32_t lastHealthCheckMs = 0;
+uint32_t lastApiValidationMs = 0;
+const uint32_t BACKGROUND_CHECK_INTERVAL_MS = 300000;
+const uint32_t POST_BOOT_CHECK_DELAY_MS = 5000;
 
 // --- Auto push configuration ---
 const float STABLE_EPSILON_G = 1.0f;        // max delta considered stable (g)
@@ -137,6 +157,8 @@ bool spoolmanSyncPending = false;
 String spoolmanDisplayLine1 = "";
 String spoolmanDisplayLine2 = "";
 uint32_t spoolmanDisplayUntilMs = 0;
+bool otaRestartPending = false;
+uint32_t otaRestartAtMs = 0;
 String autoPushUid = "";
 uint8_t autoPushAttempts = 0;
 
@@ -226,6 +248,25 @@ void displayMessage(String line1, String line2 = "", String line3 = "", String l
 
 // 🔎 OLED Display: Shows the current weight and RFID UID, plus WiFi status, on the OLED.
 //    This function is called frequently to update the main UI shown to the user.
+String bootStageCode = "";
+String bootStageLabel = "";
+
+void setBootStage(const String& code, const String& label, const String& detail = "") {
+    bootStageCode = code;
+    bootStageLabel = label;
+    Serial.printf("[BOOT %s] %s", code.c_str(), label.c_str());
+    if (detail.length() > 0) {
+        Serial.printf(" | %s", detail.c_str());
+    }
+    Serial.println();
+    displayMessage(
+        String("Boot ") + code,
+        label,
+        detail.length() ? detail : String("uptime ") + String(millis()) + "ms",
+        "diag active"
+    );
+}
+
 void displayWeight(float weight, const String& uid = "");
 
 bool checkServerHealth();
@@ -234,18 +275,26 @@ void handleAutoPush(float w);
 bool validateApiKeyFirmware(const String& key, String& displayNameOut);
 bool deleteApiKey();
 void showSpoolmanStatus(const String& line1, const String& line2 = "", uint32_t durationMs = 1800);
+void runBackgroundConnectivityChecks();
 String normalizeSpoolmanBaseUrl(const String& raw);
-String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut);
+String buildIntegrationApiBase(const IntegrationConfig& config);
+static String formatHttpFailure(int code, const String& resp);
+static String jsonEscape(const String& input);
+bool isFilamanIntegration(const IntegrationConfig& config);
+String findSpoolmanSpoolIdByUid(const IntegrationConfig& config, const String& uid, String& errorOut);
 bool fetchTigerTagProductInfo(const String& uid, uint32_t productId, TigerTagProductInfo& infoOut, String& errorOut);
 bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta& metaOut, String& errorOut);
-String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut);
-String ensureSpoolmanVendor(const String& vendorName, String& errorOut);
-String findSpoolmanFilamentIdByExternalId(const String& externalId, String& errorOut);
-String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, String& errorOut);
-String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut);
-bool syncWeightToSpoolman(const String& uid, float w, String& errorOut);
-void saveSpoolmanConfig();
+String findSpoolmanVendorIdByName(const IntegrationConfig& config, const String& vendorName, String& errorOut);
+String ensureSpoolmanVendor(const IntegrationConfig& config, const String& vendorName, String& errorOut);
+String findSpoolmanFilamentIdByExternalId(const IntegrationConfig& config, const String& externalId, String& errorOut);
+String ensureSpoolmanFilament(const IntegrationConfig& config, const String& uid, const TigerTagData& tagData, String& errorOut);
+String createSpoolmanSpool(const IntegrationConfig& config, const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut);
+bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, float w, String& errorOut);
+void saveIntegrationConfig();
 void resetAutoPushState(bool clearUid);
+bool isFilamanIntegration(const IntegrationConfig& config);
+static bool connectStoredWifi(uint32_t timeoutMs, bool disconnectFirst, const String& statusLine2);
+static bool hasStoredWifiCredentials();
 
 static uint8_t chooseTextSizeForWidth(const String& text, uint8_t preferredSize, uint8_t minSize = 1) {
     int16_t x1 = 0, y1 = 0;
@@ -263,6 +312,133 @@ static uint8_t chooseTextSizeForWidth(const String& text, uint8_t preferredSize,
 static void prepareSpoolmanHttp(HTTPClient& http) {
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
+}
+
+struct FilamanSessionState {
+    String baseUrl;
+    String cookieHeader;
+    String csrfToken;
+    uint32_t acquiredMs;
+};
+
+static FilamanSessionState filamanSession;
+
+static void invalidateFilamanSession() {
+    filamanSession.baseUrl = "";
+    filamanSession.cookieHeader = "";
+    filamanSession.csrfToken = "";
+    filamanSession.acquiredMs = 0;
+}
+
+static String extractCookieValue(const String& headerValue, const char* name) {
+    String needle = String(name) + "=";
+    int start = headerValue.indexOf(needle);
+    if (start < 0) return "";
+    start += needle.length();
+    int end = headerValue.indexOf(';', start);
+    if (end < 0) end = headerValue.length();
+    return headerValue.substring(start, end);
+}
+
+static bool ensureFilamanSession(const IntegrationConfig& config, String& errorOut) {
+    errorOut = "";
+    String baseUrl = normalizeSpoolmanBaseUrl(config.url);
+    if (baseUrl.length() == 0) {
+        errorOut = "Filaman URL is empty";
+        return false;
+    }
+
+    const bool hasCredentials = config.username.length() > 0 && config.password.length() > 0;
+    if (!hasCredentials) {
+        errorOut = "Filaman email/password not configured";
+        return false;
+    }
+
+    const uint32_t nowMs = millis();
+    if (filamanSession.baseUrl == baseUrl &&
+        filamanSession.cookieHeader.length() > 0 &&
+        filamanSession.csrfToken.length() > 0 &&
+        (nowMs - filamanSession.acquiredMs) < (10UL * 60UL * 1000UL)) {
+        return true;
+    }
+
+    HTTPClient loginHttp;
+    String loginUrl = baseUrl + "/auth/login";
+    if (!loginHttp.begin(loginUrl)) {
+        errorOut = "Failed to connect to Filaman login";
+        return false;
+    }
+
+    prepareSpoolmanHttp(loginHttp);
+    const char* headerKeys[] = {"Set-Cookie"};
+    loginHttp.collectHeaders(headerKeys, 1);
+    loginHttp.addHeader("Content-Type", "application/json");
+
+    String payload = "{\"email\":\"" + jsonEscape(config.username) + "\",\"password\":\"" + jsonEscape(config.password) + "\"}";
+    int code = loginHttp.POST(payload);
+    String response = loginHttp.getString();
+    String cookieHeaderValue = loginHttp.header("Set-Cookie");
+    loginHttp.end();
+
+    if (code < 200 || code >= 300) {
+        errorOut = formatHttpFailure(code, response);
+        return false;
+    }
+
+    String sessionId = extractCookieValue(cookieHeaderValue, "session_id");
+    String csrfToken = extractCookieValue(cookieHeaderValue, "csrf_token");
+    if (sessionId.length() == 0 || csrfToken.length() == 0) {
+        errorOut = "Filaman login did not return session cookies";
+        return false;
+    }
+
+    filamanSession.baseUrl = baseUrl;
+    filamanSession.cookieHeader = "session_id=" + sessionId + "; csrf_token=" + csrfToken;
+    filamanSession.csrfToken = csrfToken;
+    filamanSession.acquiredMs = nowMs;
+    return true;
+}
+
+static void addIntegrationAuthHeader(HTTPClient& http, const IntegrationConfig& config) {
+    if (isFilamanIntegration(config)) {
+        if (config.token.length() > 0) {
+            http.addHeader("Authorization", "ApiKey " + config.token);
+            return;
+        }
+        if (filamanSession.cookieHeader.length() > 0) {
+            http.addHeader("Cookie", filamanSession.cookieHeader);
+        }
+        if (filamanSession.csrfToken.length() > 0) {
+            http.addHeader("X-CSRF-Token", filamanSession.csrfToken);
+        }
+        setBootStage("F2", "LittleFS missing", "/www not found");
+        return;
+    }
+
+    if (config.token.length() > 0) {
+        http.addHeader("Authorization", "Bearer " + config.token);
+    }
+}
+
+static bool prepareIntegrationRequest(HTTPClient& http, const IntegrationConfig& config, String& errorOut) {
+    errorOut = "";
+    if (isFilamanIntegration(config)) {
+        if (config.token.length() == 0) {
+            if (!ensureFilamanSession(config, errorOut)) {
+                return false;
+            }
+        }
+    }
+    addIntegrationAuthHeader(http, config);
+    return true;
+}
+
+static bool hasEnabledIntegration() {
+    return spoolmanConfig.enabled || filamanConfig.enabled;
+}
+
+bool isFilamanIntegration(const IntegrationConfig& config) {
+    return String(config.name) == "Filaman";
 }
 
 static String formatHttpFailure(int code, const String& resp) {
@@ -408,6 +584,28 @@ static String buildFilamentNameFromTag(const TigerTagData& tagData, const String
     return name;
 }
 
+static String buildTigerTagExternalId(const String& uid, const TigerTagData& tagData) {
+    bool hasValidProductId = !(tagData.productId == 0 || tagData.productId == 0xFFFFFFFFu);
+    return hasValidProductId
+        ? (String("tigertag:") + String(tagData.productId))
+        : (String("tigertag-uid:") + uid);
+}
+
+static String getJsonStringValue(const JsonVariantConst& value) {
+    if (value.is<const char*>()) return String(value.as<const char*>());
+    if (value.is<String>()) return value.as<String>();
+    if (value.is<int>()) return String(value.as<int>());
+    if (value.is<long>()) return String(value.as<long>());
+    if (value.is<float>()) return String(value.as<float>(), 3);
+    if (value.is<double>()) return String(value.as<double>(), 3);
+    return "";
+}
+
+static String getCustomFieldString(const JsonVariantConst& fields, const char* key) {
+    if (fields.isNull()) return "";
+    return getJsonStringValue(fields[key]);
+}
+
 static String decodeSpoolmanExtraValue(const JsonVariantConst& value) {
     if (value.is<const char*>()) {
         String raw = String((const char*)value);
@@ -527,10 +725,30 @@ String normalizeSpoolmanBaseUrl(const String& raw) {
     return value;
 }
 
-void saveSpoolmanConfig() {
+String buildIntegrationApiBase(const IntegrationConfig& config) {
+    String baseUrl = normalizeSpoolmanBaseUrl(config.url);
+    if (baseUrl.length() == 0) return "";
+
+    String normalizedPath = String(config.apiPath);
+    while (normalizedPath.endsWith("/")) normalizedPath.remove(normalizedPath.length() - 1);
+    if (!normalizedPath.startsWith("/")) normalizedPath = "/" + normalizedPath;
+
+    if (baseUrl.endsWith(normalizedPath)) return baseUrl;
+    return baseUrl + normalizedPath;
+}
+
+void saveIntegrationConfig() {
     prefs.begin("config", false);
-    prefs.putString("spoolmanUrl", spoolmanUrl);
-    prefs.putString("spoolmanToken", spoolmanToken);
+    prefs.putBool("spoolmanEnabled", spoolmanConfig.enabled);
+    prefs.putString("spoolmanUrl", spoolmanConfig.url);
+    prefs.putString("spoolmanToken", spoolmanConfig.token);
+    prefs.putString("spoolmanUsername", spoolmanConfig.username);
+    prefs.putString("spoolmanPassword", spoolmanConfig.password);
+    prefs.putBool("filamanEnabled", filamanConfig.enabled);
+    prefs.putString("filamanUrl", filamanConfig.url);
+    prefs.putString("filamanToken", filamanConfig.token);
+    prefs.putString("filamanUsername", filamanConfig.username);
+    prefs.putString("filamanPassword", filamanConfig.password);
     prefs.end();
 }
 
@@ -634,17 +852,65 @@ bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta
     return metaOut.brandName.length() > 0 || metaOut.materialName.length() > 0 || metaOut.aspect1Name.length() > 0;
 }
 
-String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut) {
+String findSpoolmanVendorIdByName(const IntegrationConfig& config, const String& vendorName, String& errorOut) {
+    if (isFilamanIntegration(config)) {
+        errorOut = "";
+        if (!vendorName.length()) return "";
+        const String baseUrl = buildIntegrationApiBase(config);
+        for (int page = 1; page <= 20; ++page) {
+            HTTPClient http;
+            String url = baseUrl + "/manufacturers?page=" + String(page) + "&page_size=200";
+            if (!http.begin(url)) {
+                errorOut = "http begin failed";
+                return "";
+            }
+            if (!prepareIntegrationRequest(http, config, errorOut)) {
+                http.end();
+                return "";
+            }
+            int code = http.GET();
+            String resp = http.getString();
+            http.end();
+            if (code < 200 || code >= 300) {
+                errorOut = formatHttpFailure(code, resp);
+                return "";
+            }
+
+            DynamicJsonDocument doc(32768);
+            DeserializationError err = deserializeJson(doc, resp);
+            if (err) {
+                errorOut = String("json parse failed: ") + err.c_str();
+                return "";
+            }
+
+            JsonArray items = doc["items"].as<JsonArray>();
+            for (JsonObject item : items) {
+                String name = getJsonStringValue(item["name"]);
+                if (name.equalsIgnoreCase(vendorName)) {
+                    return String((int)item["id"]);
+                }
+            }
+
+            int total = doc["total"] | 0;
+            int pageSize = doc["page_size"] | 200;
+            if (items.size() == 0 || page * pageSize >= total) break;
+        }
+        return "";
+    }
+
     errorOut = "";
     if (!vendorName.length()) return "";
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String baseUrl = buildIntegrationApiBase(config);
     HTTPClient http;
-    String url = baseUrl + "/api/v1/vendor?name=" + urlEncode(vendorName);
+    String url = baseUrl + "/vendor?name=" + urlEncode(vendorName);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
-    if (spoolmanToken.length() > 0) http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
+    }
     int code = http.GET();
     if (code < 200 || code >= 300) {
         String resp = http.getString();
@@ -667,10 +933,10 @@ String findSpoolmanVendorIdByName(const String& vendorName, String& errorOut) {
     return "";
 }
 
-String ensureSpoolmanVendor(const String& vendorName, String& errorOut) {
+String ensureSpoolmanVendor(const IntegrationConfig& config, const String& vendorName, String& errorOut) {
     errorOut = "";
     if (!vendorName.length()) return "";
-    String vendorId = findSpoolmanVendorIdByName(vendorName, errorOut);
+    String vendorId = findSpoolmanVendorIdByName(config, vendorName, errorOut);
     if (vendorId.length() > 0) return vendorId;
     if (errorOut.length() > 0) return "";
 
@@ -680,15 +946,18 @@ String ensureSpoolmanVendor(const String& vendorName, String& errorOut) {
     serializeJson(payload, payloadStr);
 
     HTTPClient http;
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
-    const String url = baseUrl + "/api/v1/vendor";
-    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    const String baseUrl = buildIntegrationApiBase(config);
+    const String url = isFilamanIntegration(config) ? baseUrl + "/manufacturers" : baseUrl + "/vendor";
+    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
     http.addHeader("Content-Type", "application/json");
-    if (spoolmanToken.length() > 0) http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
+    }
     int code = http.POST(payloadStr);
     String resp = http.getString();
     http.end();
@@ -706,23 +975,68 @@ String ensureSpoolmanVendor(const String& vendorName, String& errorOut) {
     return String((int)responseDoc["id"]);
 }
 
-String findSpoolmanFilamentIdByExternalId(const String& externalId, String& errorOut) {
+String findSpoolmanFilamentIdByExternalId(const IntegrationConfig& config, const String& externalId, String& errorOut) {
     errorOut = "";
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String baseUrl = buildIntegrationApiBase(config);
     if (baseUrl.length() == 0) {
-        errorOut = "spoolman url missing";
+        errorOut = String(config.name) + " url missing";
+        return "";
+    }
+
+    if (isFilamanIntegration(config)) {
+        for (int page = 1; page <= 20; ++page) {
+            HTTPClient http;
+            String url = baseUrl + "/filaments?page=" + String(page) + "&page_size=200";
+            Serial.printf("[%s] Lookup filament via %s\n", config.name, url.c_str());
+            if (!http.begin(url)) {
+                errorOut = "http begin failed";
+                return "";
+            }
+            if (!prepareIntegrationRequest(http, config, errorOut)) {
+                http.end();
+                return "";
+            }
+
+            int code = http.GET();
+            String resp = http.getString();
+            http.end();
+            if (code < 200 || code >= 300) {
+                errorOut = formatHttpFailure(code, resp);
+                return "";
+            }
+
+            DynamicJsonDocument doc(65536);
+            DeserializationError err = deserializeJson(doc, resp);
+            if (err) {
+                errorOut = String("json parse failed: ") + err.c_str();
+                return "";
+            }
+
+            JsonArray items = doc["items"].as<JsonArray>();
+            for (JsonObject item : items) {
+                String cfExternalId = getCustomFieldString(item["custom_fields"], "spoolman_external_id");
+                if (cfExternalId == externalId) {
+                    return String((int)item["id"]);
+                }
+            }
+
+            int total = doc["total"] | 0;
+            int pageSize = doc["page_size"] | 200;
+            if (items.size() == 0 || page * pageSize >= total) break;
+        }
         return "";
     }
 
     HTTPClient http;
-    String url = baseUrl + "/api/v1/filament?external_id=" + urlEncode(String("\"") + externalId + "\"");
-    Serial.printf("[Spoolman] Lookup filament via %s\n", url.c_str());
+    String url = baseUrl + "/filament?external_id=" + urlEncode(String("\"") + externalId + "\"");
+    Serial.printf("[%s] Lookup filament via %s\n", config.name, url.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
-    if (spoolmanToken.length() > 0) {
-        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
     }
 
     int code = http.GET();
@@ -751,7 +1065,7 @@ String findSpoolmanFilamentIdByExternalId(const String& externalId, String& erro
     return "";
 }
 
-String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, String& errorOut) {
+String ensureSpoolmanFilament(const IntegrationConfig& config, const String& uid, const TigerTagData& tagData, String& errorOut) {
     errorOut = "";
     TigerTagProductInfo productInfo;
     String tigerErr;
@@ -760,13 +1074,10 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
         Serial.printf("[TigerTag] Product lookup failed for uid=%s product_id=%u: %s\n", uid.c_str(), (unsigned)tagData.productId, tigerErr.c_str());
     }
 
-    bool hasValidProductId = !(tagData.productId == 0 || tagData.productId == 0xFFFFFFFFu);
-    String externalId = hasValidProductId
-        ? (String("tigertag:") + String(tagData.productId))
-        : (String("tigertag-uid:") + uid);
-    String filamentId = findSpoolmanFilamentIdByExternalId(externalId, errorOut);
+    String externalId = buildTigerTagExternalId(uid, tagData);
+    String filamentId = findSpoolmanFilamentIdByExternalId(config, externalId, errorOut);
     if (filamentId.length() > 0) {
-        Serial.printf("[Spoolman] Using existing filament %s for %s\n", filamentId.c_str(), externalId.c_str());
+        Serial.printf("[%s] Using existing filament %s for %s\n", config.name, filamentId.c_str(), externalId.c_str());
         return filamentId;
     }
     if (errorOut.length() > 0) return "";
@@ -799,44 +1110,66 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
     String vendorId = "";
     if (brandName.length()) {
         String vendorErr;
-        vendorId = ensureSpoolmanVendor(brandName, vendorErr);
-        if (vendorErr.length()) Serial.printf("[Spoolman] Vendor ensure failed for %s: %s\n", brandName.c_str(), vendorErr.c_str());
+        vendorId = ensureSpoolmanVendor(config, brandName, vendorErr);
+        if (vendorErr.length()) Serial.printf("[%s] Vendor ensure failed for %s: %s\n", config.name, brandName.c_str(), vendorErr.c_str());
+    }
+    if (isFilamanIntegration(config) && vendorId.length() == 0) {
+        String vendorErr;
+        vendorId = ensureSpoolmanVendor(config, brandName.length() ? brandName : "TigerTag", vendorErr);
+        if (vendorErr.length()) Serial.printf("[%s] Fallback manufacturer ensure failed: %s\n", config.name, vendorErr.c_str());
     }
 
-    DynamicJsonDocument payload(1024);
-    payload["name"] = filamentName;
-    payload["material"] = materialName;
-    payload["external_id"] = externalId;
-    if (aspect1Name.length()) payload["comment"] = aspect1Name;
-    if (vendorId.length()) payload["vendor_id"] = vendorId.toInt();
-    if (hasSecondColor || hasThirdColor) {
-        String multiColors = primaryRgbHex;
-        if (hasSecondColor) multiColors += "," + secondaryRgbHex;
-        if (hasThirdColor) multiColors += "," + tertiaryRgbHex;
-        payload["multi_color_hexes"] = multiColors;
-        payload["multi_color_direction"] = "longitudinal";
+    DynamicJsonDocument payload(2048);
+    if (isFilamanIntegration(config)) {
+        if (!vendorId.length()) {
+            errorOut = "manufacturer missing";
+            return "";
+        }
+        payload["manufacturer_id"] = vendorId.toInt();
+        payload["designation"] = filamentName;
+        payload["material_type"] = materialName;
+        if (!isnan(diameter)) payload["diameter_mm"] = diameter;
+        if (brandName.length()) payload["manufacturer_color_name"] = filamentName;
+        if (!isnan(netWeight) && netWeight > 0) payload["raw_material_weight_g"] = netWeight;
+        if (density > 0) payload["density_g_cm3"] = density;
+        JsonObject customFields = payload.createNestedObject("custom_fields");
+        customFields["spoolman_external_id"] = externalId;
     } else {
-        payload["color_hex"] = colorHex;
+        payload["name"] = filamentName;
+        payload["material"] = materialName;
+        payload["external_id"] = externalId;
+        if (aspect1Name.length()) payload["comment"] = aspect1Name;
+        if (vendorId.length()) payload["vendor_id"] = vendorId.toInt();
+        if (hasSecondColor || hasThirdColor) {
+            String multiColors = primaryRgbHex;
+            if (hasSecondColor) multiColors += "," + secondaryRgbHex;
+            if (hasThirdColor) multiColors += "," + tertiaryRgbHex;
+            payload["multi_color_hexes"] = multiColors;
+            payload["multi_color_direction"] = "longitudinal";
+        } else {
+            payload["color_hex"] = colorHex;
+        }
+        payload["density"] = density;
+        if (!isnan(diameter)) payload["diameter"] = diameter;
+        if (!isnan(netWeight) && netWeight > 0) payload["weight"] = netWeight;
+        if (extruderTemp > 0) payload["settings_extruder_temp"] = extruderTemp;
     }
-    payload["density"] = density;
-    if (!isnan(diameter)) payload["diameter"] = diameter;
-    if (!isnan(netWeight) && netWeight > 0) payload["weight"] = netWeight;
-    if (extruderTemp > 0) payload["settings_extruder_temp"] = extruderTemp;
 
     String payloadStr;
     serializeJson(payload, payloadStr);
 
     HTTPClient http;
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
-    const String url = baseUrl + "/api/v1/filament";
-    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    const String baseUrl = buildIntegrationApiBase(config);
+    const String url = isFilamanIntegration(config) ? baseUrl + "/filaments" : baseUrl + "/filament";
+    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
     http.addHeader("Content-Type", "application/json");
-    if (spoolmanToken.length() > 0) {
-        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
     }
     int code = http.POST(payloadStr);
     String resp = http.getString();
@@ -855,37 +1188,49 @@ String ensureSpoolmanFilament(const String& uid, const TigerTagData& tagData, St
     }
 
     String createdFilamentId = String((int)responseDoc["id"]);
-    Serial.printf("[Spoolman] Created filament %s for %s\n", createdFilamentId.c_str(), externalId.c_str());
+    Serial.printf("[%s] Created filament %s for %s\n", config.name, createdFilamentId.c_str(), externalId.c_str());
     return createdFilamentId;
 }
 
-String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut) {
-    String filamentId = ensureSpoolmanFilament(uid, tagData, errorOut);
+String createSpoolmanSpool(const IntegrationConfig& config, const String& uid, const TigerTagData& tagData, float currentMeasuredWeight, String& errorOut) {
+    String filamentId = ensureSpoolmanFilament(config, uid, tagData, errorOut);
     if (filamentId.length() == 0) return "";
+
+    String externalId = buildTigerTagExternalId(uid, tagData);
 
     DynamicJsonDocument payload(1024);
     payload["filament_id"] = filamentId.toInt();
     int currentWeight = (int)(currentMeasuredWeight + (currentMeasuredWeight >= 0 ? 0.5f : -0.5f));
     if (currentWeight < 0) currentWeight = 0;
-    payload["remaining_weight"] = currentWeight;
-    if (tagData.weightValue > 0) payload["initial_weight"] = tagData.weightValue;
-    JsonObject extra = payload.createNestedObject("extra");
-    extra["rfid_uid"] = uid;
+    if (isFilamanIntegration(config)) {
+        payload["remaining_weight_g"] = currentWeight;
+        payload["rfid_uid"] = uid;
+        payload["external_id"] = externalId;
+        if (tagData.weightValue > 0) payload["initial_total_weight_g"] = tagData.weightValue;
+        JsonObject customFields = payload.createNestedObject("custom_fields");
+        customFields["spoolman_external_id"] = externalId;
+    } else {
+        payload["remaining_weight"] = currentWeight;
+        if (tagData.weightValue > 0) payload["initial_weight"] = tagData.weightValue;
+        JsonObject extra = payload.createNestedObject("extra");
+        extra["rfid_uid"] = uid;
+    }
 
     String payloadStr;
     serializeJson(payload, payloadStr);
 
     HTTPClient http;
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
-    const String url = baseUrl + "/api/v1/spool";
-    Serial.printf("[Spoolman] POST %s payload=%s\n", url.c_str(), payloadStr.c_str());
+    const String baseUrl = buildIntegrationApiBase(config);
+    const String url = isFilamanIntegration(config) ? baseUrl + "/spools" : baseUrl + "/spool";
+    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
     http.addHeader("Content-Type", "application/json");
-    if (spoolmanToken.length() > 0) {
-        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
     }
     int code = http.POST(payloadStr);
     String resp = http.getString();
@@ -904,29 +1249,103 @@ String createSpoolmanSpool(const String& uid, const TigerTagData& tagData, float
     }
 
     String spoolId = String((int)responseDoc["id"]);
-    Serial.printf("[Spoolman] Created spool %s for UID %s\n", spoolId.c_str(), uid.c_str());
+    Serial.printf("[%s] Created spool %s for UID %s\n", config.name, spoolId.c_str(), uid.c_str());
     return spoolId;
 }
 
-String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
+String findSpoolmanSpoolIdByUid(const IntegrationConfig& config, const String& uid, String& errorOut) {
     errorOut = "";
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String baseUrl = buildIntegrationApiBase(config);
     if (baseUrl.length() == 0) {
-        errorOut = "spoolman url missing";
+        errorOut = String(config.name) + " url missing";
+        return "";
+    }
+
+    if (isFilamanIntegration(config)) {
+        String externalId = buildTigerTagExternalId(uid, lastTigerTagData);
+        for (int page = 1; page <= 20; ++page) {
+            HTTPClient http;
+            const String url = baseUrl + "/spools?page=" + String(page) + "&page_size=200&include_archived=true";
+            Serial.printf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
+            prepareSpoolmanHttp(http);
+            if (!http.begin(url)) {
+                errorOut = "http begin failed";
+                return "";
+            }
+
+            if (!prepareIntegrationRequest(http, config, errorOut)) {
+                http.end();
+                return "";
+            }
+            const int code = http.GET();
+            const String resp = http.getString();
+            http.end();
+            if (code < 200 || code >= 300) {
+                errorOut = formatHttpFailure(code, resp);
+                return "";
+            }
+
+            DynamicJsonDocument doc(131072);
+            DeserializationError err = deserializeJson(doc, resp);
+            if (err) {
+                errorOut = String("json parse failed: ") + err.c_str();
+                return "";
+            }
+
+            JsonArray spools = doc["items"].as<JsonArray>();
+            for (JsonObject spool : spools) {
+                String spoolUid = getJsonStringValue(spool["rfid_uid"]);
+                String spoolExternalId = getJsonStringValue(spool["external_id"]);
+                String filamentExternalId = getCustomFieldString(spool["filament"]["custom_fields"], "spoolman_external_id");
+                if (spoolUid == uid || spoolExternalId == externalId || filamentExternalId == externalId) {
+                    String spoolId = String((int)spool["id"]);
+                    bool needsPatch = spoolUid.length() == 0 || spoolExternalId.length() == 0;
+                    if (needsPatch) {
+                        HTTPClient patchHttp;
+                        String patchUrl = baseUrl + "/spools/" + spoolId;
+                        if (!patchHttp.begin(patchUrl)) {
+                            errorOut = "http begin failed";
+                            return "";
+                        }
+                        patchHttp.addHeader("Content-Type", "application/json");
+                        if (!prepareIntegrationRequest(patchHttp, config, errorOut)) {
+                            patchHttp.end();
+                            return "";
+                        }
+                        String patchPayload = String("{\"rfid_uid\":\"") + jsonEscape(uid) + "\",\"external_id\":\"" + jsonEscape(externalId) + "\"}";
+                        int patchCode = patchHttp.PATCH(patchPayload);
+                        String patchResp = patchHttp.getString();
+                        patchHttp.end();
+                        if (patchCode < 200 || patchCode >= 300) {
+                            errorOut = formatHttpFailure(patchCode, patchResp);
+                            return "";
+                        }
+                    }
+                    return spoolId;
+                }
+            }
+
+            int total = doc["total"] | 0;
+            int pageSize = doc["page_size"] | 200;
+            if (spools.size() == 0 || page * pageSize >= total) break;
+        }
+
+        errorOut = "no spool with filaman identifiers";
         return "";
     }
 
     HTTPClient http;
-    const String url = baseUrl + "/api/v1/spool";
-    Serial.printf("[Spoolman] Lookup UID %s via %s\n", uid.c_str(), url.c_str());
+    const String url = baseUrl + "/spool";
+    Serial.printf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
     prepareSpoolmanHttp(http);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
     }
 
-    if (spoolmanToken.length() > 0) {
-        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
     }
 
     const int code = http.GET();
@@ -952,13 +1371,13 @@ String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
     }
 
     JsonArray spools = doc.as<JsonArray>();
-    Serial.printf("[Spoolman] Lookup response contains %u spool entries\n", (unsigned)spools.size());
+    Serial.printf("[%s] Lookup response contains %u spool entries\n", config.name, (unsigned)spools.size());
     for (JsonObject spool : spools) {
         String extraUid = decodeSpoolmanExtraValue(spool["extra"]["rfid_uid"]);
         extraUid.trim();
         if (extraUid == uid) {
             String spoolId = String((int)spool["id"]);
-            Serial.printf("[Spoolman] UID %s matched spool %s\n", uid.c_str(), spoolId.c_str());
+            Serial.printf("[%s] UID %s matched spool %s\n", config.name, uid.c_str(), spoolId.c_str());
             return spoolId;
         }
     }
@@ -967,20 +1386,72 @@ String findSpoolmanSpoolIdByUid(const String& uid, String& errorOut) {
     return "";
 }
 
-bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
+bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, float w, String& errorOut) {
     errorOut = "";
     if (!wifiConnected || !WiFi.isConnected()) {
         errorOut = "wifi disconnected";
         return false;
     }
 
-    const String baseUrl = normalizeSpoolmanBaseUrl(spoolmanUrl);
+    const String baseUrl = buildIntegrationApiBase(config);
     if (baseUrl.length() == 0) {
-        errorOut = "spoolman url missing";
+        errorOut = String(config.name) + " url missing";
         return false;
     }
 
-    const String spoolId = findSpoolmanSpoolIdByUid(uid, errorOut);
+    if (isFilamanIntegration(config)) {
+        String externalId = buildTigerTagExternalId(uid, lastTigerTagData);
+        auto postMeasurement = [&](String& measurementError) -> bool {
+            HTTPClient http;
+            const String url = baseUrl + "/spool-measurements";
+            prepareSpoolmanHttp(http);
+            if (!http.begin(url)) {
+                measurementError = "http begin failed";
+                return false;
+            }
+            http.addHeader("Content-Type", "application/json");
+            if (!prepareIntegrationRequest(http, config, measurementError)) {
+                http.end();
+                return false;
+            }
+            const int weightInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
+            const int clampedWeight = weightInt < 0 ? 0 : weightInt;
+            String payload = String("{\"rfid_uid\":\"") + jsonEscape(uid) +
+                "\",\"external_id\":\"" + jsonEscape(externalId) +
+                "\",\"measured_weight_g\":" + String(clampedWeight) + "}";
+            Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payload.c_str());
+            int code = http.POST(payload);
+            String resp = http.getString();
+            http.end();
+            if (code >= 200 && code < 300) return true;
+            measurementError = formatHttpFailure(code, resp);
+            return false;
+        };
+
+        String measurementError;
+        if (postMeasurement(measurementError)) return true;
+
+        String lookupError;
+        String spoolId = findSpoolmanSpoolIdByUid(config, uid, lookupError);
+        if (spoolId.length() == 0) {
+            if (!lastTigerTagData.valid) {
+                errorOut = measurementError.length() ? measurementError : lookupError;
+                return false;
+            }
+            Serial.printf("[%s] No Filaman spool found for UID %s, creating one from TigerTag data\n", config.name, uid.c_str());
+            spoolId = createSpoolmanSpool(config, uid, lastTigerTagData, w, lookupError);
+            if (spoolId.length() == 0) {
+                errorOut = lookupError.length() ? lookupError : measurementError;
+                return false;
+            }
+        }
+
+        if (postMeasurement(measurementError)) return true;
+        errorOut = measurementError;
+        return false;
+    }
+
+    const String spoolId = findSpoolmanSpoolIdByUid(config, uid, errorOut);
     String resolvedSpoolId = spoolId;
     if (resolvedSpoolId.length() == 0) {
         if (errorOut == "no spool with extra_rfid_uid") {
@@ -988,8 +1459,8 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
                 errorOut = "no spool with extra_rfid_uid and no TigerTag payload available";
                 return false;
             }
-            Serial.printf("[Spoolman] No spool found for UID %s, creating one from TigerTag data\n", uid.c_str());
-            resolvedSpoolId = createSpoolmanSpool(uid, lastTigerTagData, w, errorOut);
+            Serial.printf("[%s] No spool found for UID %s, creating one from TigerTag data\n", config.name, uid.c_str());
+            resolvedSpoolId = createSpoolmanSpool(config, uid, lastTigerTagData, w, errorOut);
             if (resolvedSpoolId.length() == 0) return false;
         } else {
             return false;
@@ -997,7 +1468,7 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
     }
 
     HTTPClient http;
-    const String url = baseUrl + "/api/v1/spool/" + resolvedSpoolId;
+    const String url = baseUrl + "/spool/" + resolvedSpoolId;
     prepareSpoolmanHttp(http);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
@@ -1005,14 +1476,15 @@ bool syncWeightToSpoolman(const String& uid, float w, String& errorOut) {
     }
 
     http.addHeader("Content-Type", "application/json");
-    if (spoolmanToken.length() > 0) {
-        http.addHeader("Authorization", "Bearer " + spoolmanToken);
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return false;
     }
 
     const int weightInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
     const int clampedWeight = weightInt < 0 ? 0 : weightInt;
     String payload = String("{\"remaining_weight\":") + String(clampedWeight) + "}";
-    Serial.printf("[Spoolman] PATCH %s payload=%s\n", url.c_str(), payload.c_str());
+    Serial.printf("[%s] PATCH %s payload=%s\n", config.name, url.c_str(), payload.c_str());
     const int code = http.PATCH(payload);
     const String resp = http.getString();
     http.end();
@@ -1036,7 +1508,7 @@ void displayWeight(float weight, const String& uid) {
     display.println("Tiger-Scale");
     
     display.setTextSize(1);
-    display.setCursor(100, 0);
+    display.setCursor(80, 0);
     display.println(wifiConnected ? "WiFi" : "----");
 
     // Hold mode indicator (🅗 at x=112, y=0)
@@ -1098,6 +1570,51 @@ void resetAutoPushState(bool clearUid) {
     }
 }
 
+static size_t otaCommandMaxSize(uint8_t command) {
+    if (command == U_FLASH) {
+        return (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    }
+    return UPDATE_SIZE_UNKNOWN;
+}
+
+static void handleOtaUpload(
+    AsyncWebServerRequest *request,
+    const String& filename,
+    size_t index,
+    uint8_t *data,
+    size_t len,
+    bool final,
+    uint8_t command,
+    const char* targetLabel
+) {
+    if (index == 0) {
+        Serial.printf("[OTA] Starting %s upload: %s\n", targetLabel, filename.c_str());
+        showSpoolmanStatus("OTA Upload", targetLabel, 4000);
+        if (command != U_FLASH) {
+            LittleFS.end();
+        }
+        if (!Update.begin(otaCommandMaxSize(command), command)) {
+            Update.printError(Serial);
+        }
+    }
+
+    if (!Update.hasError() && Update.write(data, len) != len) {
+        Update.printError(Serial);
+    }
+
+    if (final) {
+        if (Update.end(true)) {
+            Serial.printf("[OTA] %s update complete (%u bytes)\n", targetLabel, (unsigned)(index + len));
+            showSpoolmanStatus("OTA Complete", targetLabel, 5000);
+            otaRestartPending = true;
+            otaRestartAtMs = millis() + 5000;
+        } else {
+            Update.printError(Serial);
+            showSpoolmanStatus("OTA Failed", targetLabel, 5000);
+        }
+    }
+}
+
 // ============================================================================
 // PORTAIL CAPTIF & CONFIGURATION
 // ============================================================================
@@ -1115,6 +1632,33 @@ void saveConfigCallback() {
     delay(800);
 }
 
+static bool connectStoredWifi(uint32_t timeoutMs, bool disconnectFirst, const String& statusLine2) {
+    displayMessage("Connecting WiFi", statusLine2);
+    if (disconnectFirst) {
+        WiFi.disconnect(false, false);
+        delay(250);
+    }
+    WiFi.begin();
+
+    const uint32_t attemptStart = millis();
+    while (millis() - attemptStart < timeoutMs) {
+        if (WiFi.status() == WL_CONNECTED) {
+            return true;
+        }
+        delay(250);
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
+static bool hasStoredWifiCredentials() {
+    wifi_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK) {
+        return false;
+    }
+    return cfg.sta.ssid[0] != '\0';
+}
+
 // 🔎 WiFiManager: Handles WiFi configuration and captive portal using WiFiManager.
 //    This enables easy setup via a smartphone/laptop without hardcoding credentials.
 //    After connection, sets up mDNS and checks cloud health.
@@ -1126,36 +1670,39 @@ void setupWiFi() {
     wm.setSaveConfigCallback(saveConfigCallback);
     wm.setConfigPortalTimeout(180);
     
-    displayMessage("Connecting to WiFi...", "Waiting...");
+    setBootStage("W1", "WiFi init");
     gSetupSsid = makeSetupSSID();
     gMdnsName = String("tigerscale-") + macSuffix4();
     WiFi.setHostname(gMdnsName.c_str());
 
     WiFi.mode(WIFI_STA);
-    bool connected = false;
-    for (int attempt = 1; attempt <= 2 && !connected; ++attempt) {
-        displayMessage("Connecting WiFi", String("Try ") + attempt + "/2");
-        WiFi.disconnect(false, false);
-        delay(250);
-        WiFi.begin();
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    const bool haveSavedWifi = hasStoredWifiCredentials();
 
-        const uint32_t attemptStart = millis();
-        while (millis() - attemptStart < 10000) {
-            if (WiFi.status() == WL_CONNECTED) {
-                connected = true;
-                break;
-            }
-            delay(250);
-        }
+    bool connected = connectStoredWifi(30000, false, "Try 1/2");
+    if (!connected) {
+        setBootStage("W2", "WiFi retry", "attempt 2/2");
+        connected = connectStoredWifi(20000, true, "Try 2/2");
     }
 
     if (!connected) {
-        displayMessage("WiFi failed", "Starting AP");
-        delay(1200);
-        if (!wm.startConfigPortal(gSetupSsid.c_str())) {
-            displayMessage("AP timeout", "Restarting...");
-            delay(3000);
-            ESP.restart();
+        if (haveSavedWifi) {
+            Serial.println("[WiFi] Stored credentials found; staying in STA mode and retrying in background");
+            setBootStage("W3", "WiFi deferred", "saved creds retry");
+            wifiPortalDeferred = true;
+            wifiPortalActive = false;
+            wifiPortalFallbackAtMs = millis() + WIFI_PORTAL_FALLBACK_DELAY_MS;
+        } else {
+            setBootStage("W4", "WiFi AP mode", gSetupSsid);
+            delay(1200);
+            wifiPortalDeferred = false;
+            wifiPortalActive = true;
+            if (!wm.startConfigPortal(gSetupSsid.c_str())) {
+                displayMessage("AP timeout", "Restarting...");
+                delay(3000);
+                ESP.restart();
+            }
         }
     }
     
@@ -1168,20 +1715,25 @@ void setupWiFi() {
     if (WiFi.isConnected()) {
         startMDNS();
     }
-    wifiConnected = true;
-    wm.stopWebPortal();
-    wm.stopConfigPortal();
-
-    // Check TigerTag cloud health (lightweight)
-    cloudOK = checkServerHealth();
+    wifiConnected = WiFi.isConnected();
+    if (wifiConnected) {
+        wifiPortalDeferred = false;
+        wifiPortalActive = false;
+        wm.stopWebPortal();
+        wm.stopConfigPortal();
+    }
 
     displayMessage(
-        "WiFi Connected!",
-        WiFi.SSID(),
-        WiFi.localIP().toString(),
-        cloudOK ? "Cloud: OK" : "Cloud: FAIL"
+        wifiConnected ? "WiFi Connected!" : "WiFi Offline",
+        wifiConnected ? WiFi.SSID() : "Reconnect pending",
+        wifiConnected ? WiFi.localIP().toString() : gSetupSsid,
+        wifiConnected ? "Starting web..." : "Auto reconnect on"
     );
-    delay(2000);
+    Serial.printf("[BOOT W9] WiFi result | connected=%s ip=%s portalDeferred=%s\n",
+        wifiConnected ? "true" : "false",
+        WiFi.localIP().toString().c_str(),
+        wifiPortalDeferred ? "true" : "false");
+    delay(600);
 }
 
 // ============================================================================
@@ -1205,7 +1757,12 @@ void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
     if(file.isDirectory()){
       Serial.printf("DIR  %s\n", file.name());
       if (levels){
-        String sub = String(file.name());
+        String sub = String(dirname);
+        if (!sub.endsWith("/")) sub += "/";
+        String childName = String(file.name());
+        int slash = childName.lastIndexOf('/');
+        if (slash >= 0) childName = childName.substring(slash + 1);
+        sub += childName;
         listDir(fs, sub.c_str(), levels - 1);
       }
     } else {
@@ -1222,6 +1779,7 @@ void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
 //    The /www directory contains all static web content (HTML, CSS, JS, images).
 //    This allows the ESP32 to serve a rich web interface directly from flash.
 void setupFileSystem() {
+    setBootStage("F1", "LittleFS mount");
     Serial.println("\n[LITTLEFS] Initialisation...");
     
     if (!LittleFS.begin(true)) {  // true = format si échec
@@ -1242,6 +1800,7 @@ void setupFileSystem() {
     }
     // Recursive listing including /www/img etc.
     listDir(LittleFS, "/www", 3);
+    setBootStage("F9", "LittleFS ready");
 }
 
 // Validate API key against TigerTag CDN (firmware-side)
@@ -1405,6 +1964,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 // SERVEUR WEB & API
 // ============================================
 void setupWebServer() {
+    setBootStage("S1", "Web routes");
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
     
@@ -1453,6 +2013,10 @@ void setupWebServer() {
         request->send(404, "text/plain", "style.css(.gz) not found");
     });
     server.serveStatic("/styles.css", LittleFS, "/www/styles.css").setCacheControl("no-store");
+    server.serveStatic("/favicon.ico", LittleFS, "/www/favicon.ico").setCacheControl("no-store");
+    server.serveStatic("/favicon.png", LittleFS, "/www/favicon.png").setCacheControl("no-store");
+    server.serveStatic("/manifest.json", LittleFS, "/www/manifest.json").setCacheControl("no-store");
+    server.serveStatic("/sw.js", LittleFS, "/www/sw.js").setCacheControl("no-store");
     
     // JavaScript (app.js, fallback to .gz), no-store
     // 🔎 Routing: Serve JavaScript, prefer uncompressed for debugging, fallback to .gz.
@@ -1505,13 +2069,71 @@ void setupWebServer() {
                 return;
             }
 
-            spoolmanUrl = normalizeSpoolmanBaseUrl(doc["url"] | "");
-            spoolmanToken = String((const char*)(doc["token"] | ""));
-            spoolmanToken.trim();
-            saveSpoolmanConfig();
-            Serial.printf("[Spoolman] Config saved. url=%s token=%s\n", spoolmanUrl.c_str(), spoolmanToken.length() ? "<set>" : "<empty>");
+            spoolmanConfig.enabled = doc["enabled"] | false;
+            spoolmanConfig.url = normalizeSpoolmanBaseUrl(doc["url"] | "");
+            spoolmanConfig.token = String((const char*)(doc["token"] | ""));
+            spoolmanConfig.token.trim();
+            spoolmanConfig.username = String((const char*)(doc["username"] | ""));
+            spoolmanConfig.username.trim();
+            spoolmanConfig.password = String((const char*)(doc["password"] | ""));
+            spoolmanConfig.password.trim();
+            saveIntegrationConfig();
+            Serial.printf("[Spoolman] Config saved. enabled=%s url=%s token=%s\n",
+                spoolmanConfig.enabled ? "true" : "false",
+                spoolmanConfig.url.c_str(),
+                spoolmanConfig.token.length() ? "<set>" : "<empty>");
 
             request->send(200, "application/json", "{\"success\":true}");
+        }
+    );
+
+    server.on("/api/filaman", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<2048> doc;
+            DeserializationError err = deserializeJson(doc, data, len);
+            if (err) {
+                request->send(400, "application/json", String("{\"success\":false,\"error\":\"") + err.c_str() + "\"}");
+                return;
+            }
+
+            filamanConfig.enabled = doc["enabled"] | false;
+            filamanConfig.url = normalizeSpoolmanBaseUrl(doc["url"] | "");
+            filamanConfig.token = String((const char*)(doc["token"] | ""));
+            filamanConfig.token.trim();
+            filamanConfig.username = String((const char*)(doc["username"] | ""));
+            filamanConfig.username.trim();
+            filamanConfig.password = String((const char*)(doc["password"] | ""));
+            filamanConfig.password.trim();
+            invalidateFilamanSession();
+            saveIntegrationConfig();
+            Serial.printf("[Filaman] Config saved. enabled=%s url=%s token=%s username=%s password=%s\n",
+                filamanConfig.enabled ? "true" : "false",
+                filamanConfig.url.c_str(),
+                filamanConfig.token.length() ? "<set>" : "<empty>",
+                filamanConfig.username.length() ? "<set>" : "<empty>",
+                filamanConfig.password.length() ? "<set>" : "<empty>");
+
+            request->send(200, "application/json", "{\"success\":true}");
+        }
+    );
+
+    server.on("/api/ota/firmware", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            const bool ok = !Update.hasError();
+            request->send(ok ? 200 : 500, "application/json", ok ? "{\"success\":true,\"restarting\":true}" : "{\"success\":false}");
+        },
+        [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+            handleOtaUpload(request, filename, index, data, len, final, U_FLASH, "Firmware");
+        }
+    );
+
+    server.on("/api/ota/filesystem", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            const bool ok = !Update.hasError();
+            request->send(ok ? 200 : 500, "application/json", ok ? "{\"success\":true,\"restarting\":true}" : "{\"success\":false}");
+        },
+        [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+            handleOtaUpload(request, filename, index, data, len, final, U_SPIFFS, "Filesystem");
         }
     );
     
@@ -1553,8 +2175,6 @@ void setupWebServer() {
         json += "\"apiKey\":\"" + apiKey + "\",";
         json += "\"apiValid\":" + String(apiValid ? "true" : "false") + ",";
         json += "\"displayName\":\"" + apiDisplayName + "\",";
-        json += "\"spoolmanUrl\":\"" + jsonEscape(spoolmanUrl) + "\",";
-        json += "\"spoolmanToken\":\"" + jsonEscape(spoolmanToken) + "\",";
         json += "\"calibrationFactor\":" + String(calibrationFactor, 4) + ",";
         json += "\"uptime_ms\":" + String(millis()) + ","; // milliseconds since boot
         json += "\"uptime_s\":" + String(millis() / 1000) + ",";
@@ -1566,6 +2186,22 @@ void setupWebServer() {
         else if (sendPhase == "error")                             stc = "error";
         else                                                        stc = "";
         json += "\"sendToCloud\":\"" + stc + "\"";
+        json += "}";
+        request->send(200, "application/json", json);
+    });
+
+    server.on("/api/integrations", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String json = "{";
+        json += "\"spoolmanEnabled\":" + String(spoolmanConfig.enabled ? "true" : "false") + ",";
+        json += "\"spoolmanUrl\":\"" + jsonEscape(spoolmanConfig.url) + "\",";
+        json += "\"spoolmanToken\":\"" + jsonEscape(spoolmanConfig.token) + "\",";
+        json += "\"spoolmanUsername\":\"" + jsonEscape(spoolmanConfig.username) + "\",";
+        json += "\"spoolmanPassword\":\"" + jsonEscape(spoolmanConfig.password) + "\",";
+        json += "\"filamanEnabled\":" + String(filamanConfig.enabled ? "true" : "false") + ",";
+        json += "\"filamanUrl\":\"" + jsonEscape(filamanConfig.url) + "\",";
+        json += "\"filamanToken\":\"" + jsonEscape(filamanConfig.token) + "\",";
+        json += "\"filamanUsername\":\"" + jsonEscape(filamanConfig.username) + "\",";
+        json += "\"filamanPassword\":\"" + jsonEscape(filamanConfig.password) + "\"";
         json += "}";
         request->send(200, "application/json", json);
     });
@@ -1829,6 +2465,7 @@ void setupWebServer() {
     
     server.begin();
     Serial.println("✅ Serveur web démarré sur port 80");
+    setBootStage("S9", "Web server ready");
 }
 
 // Helper: push weight to TigerTag Cloud Function
@@ -1973,6 +2610,31 @@ void startMDNS() {
     }
 }
 
+void runBackgroundConnectivityChecks() {
+    if (!WiFi.isConnected()) return;
+
+    const uint32_t now = millis();
+    if (now < POST_BOOT_CHECK_DELAY_MS) return;
+
+    if (lastHealthCheckMs == 0 || now - lastHealthCheckMs >= BACKGROUND_CHECK_INTERVAL_MS) {
+        lastHealthCheckMs = now;
+        cloudOK = checkServerHealth();
+    }
+
+    if (apiKey.length() > 0 && (apiValid == false || lastApiValidationMs == 0 || now - lastApiValidationMs >= BACKGROUND_CHECK_INTERVAL_MS)) {
+        lastApiValidationMs = now;
+        String dn;
+        const bool ok = validateApiKeyFirmware(apiKey, dn);
+        apiValid = ok;
+        if (ok && dn.length()) {
+            apiDisplayName = dn;
+            prefs.begin("config", false);
+            prefs.putString("apiName", apiDisplayName);
+            prefs.end();
+        }
+    }
+}
+
 void onWiFiEvent(WiFiEvent_t event) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -1980,7 +2642,14 @@ void onWiFiEvent(WiFiEvent_t event) {
         case SYSTEM_EVENT_STA_GOT_IP:
 #endif
             wifiConnected = true;
+            wifiPortalDeferred = false;
+            wifiPortalActive = false;
+            lastHealthCheckMs = 0;
+            lastApiValidationMs = 0;
             Serial.println("[WiFi] GOT_IP: " + WiFi.localIP().toString());
+            if (bootStageCode != "09") {
+                setBootStage("W8", "WiFi got IP", WiFi.localIP().toString());
+            }
             startMDNS();
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -1988,8 +2657,13 @@ void onWiFiEvent(WiFiEvent_t event) {
         case SYSTEM_EVENT_STA_DISCONNECTED:
 #endif
             wifiConnected = false;
+            cloudOK = false;
             Serial.println("[WiFi] DISCONNECTED");
+            if (bootStageCode != "09") {
+                setBootStage("WD", "WiFi lost", WiFi.SSID());
+            }
             MDNS.end();
+            WiFi.reconnect();
             break;
         default:
             break;
@@ -2001,11 +2675,13 @@ void onWiFiEvent(WiFiEvent_t event) {
 // ============================================================================
 
 void setupScale() {
+    setBootStage("H1", "Scale init");
     scale.begin(HX711_DOUT, HX711_SCK);
     scale.set_scale(calibrationFactor);
     scale.tare();
     
     displayMessage("Scale OK", "Tare done");
+    Serial.println("[BOOT H9] Scale ready");
     delay(1000);
 }
 
@@ -2059,9 +2735,11 @@ static String u64ToDec(uint64_t v) {
 }
 
 void setupRFID() {
+    setBootStage("R1", "RFID init");
     SPI.begin();
     rfid.PCD_Init();
     displayMessage("RFID OK", "RC522 ready");
+    Serial.println("[BOOT R9] RFID ready");
     delay(1000);
 }
 
@@ -2137,6 +2815,8 @@ bool checkServerHealth() {
 
 void setup() {
     Serial.begin(115200);
+    Serial.println();
+    Serial.println("[BOOT 00] Reset -> setup()");
     pinMode(LED_PIN, OUTPUT);
     Wire.begin(21, 22);
     
@@ -2145,40 +2825,44 @@ void setup() {
         while (1);
     }
     
-    displayMessage("TigerTagScale", "Starting...", "v1.1.0");
+    setBootStage("01", "OLED ready", "v1.1.0");
     delay(2500);
     
+    setBootStage("02", "Prefs load");
     prefs.begin("config", true);
     apiKey = prefs.getString("apiKey", "");
     calibrationFactor = prefs.getFloat("calFactor", calibrationFactor);
     apiDisplayName = prefs.getString("apiName", "");
-    spoolmanUrl = normalizeSpoolmanBaseUrl(prefs.getString("spoolmanUrl", ""));
-    spoolmanToken = prefs.getString("spoolmanToken", "");
+    spoolmanConfig.enabled = prefs.getBool("spoolmanEnabled", false);
+    spoolmanConfig.url = normalizeSpoolmanBaseUrl(prefs.getString("spoolmanUrl", ""));
+    spoolmanConfig.token = prefs.getString("spoolmanToken", "");
+    spoolmanConfig.username = prefs.getString("spoolmanUsername", "");
+    spoolmanConfig.password = prefs.getString("spoolmanPassword", "");
+    filamanConfig.enabled = prefs.getBool("filamanEnabled", false);
+    filamanConfig.url = normalizeSpoolmanBaseUrl(prefs.getString("filamanUrl", ""));
+    filamanConfig.token = prefs.getString("filamanToken", "");
+    filamanConfig.username = prefs.getString("filamanUsername", "");
+    filamanConfig.password = prefs.getString("filamanPassword", "");
     prefs.end();
     
+    setBootStage("03", "WiFi event hook");
     WiFi.onEvent(onWiFiEvent);
     setupWiFi();
     if (WiFi.isConnected()) {
         startMDNS();
     }
 
-    // On boot: validate existing API key once
-    if (apiKey.length() > 0 && WiFi.isConnected()) {
-        String dn;
-        apiValid = validateApiKeyFirmware(apiKey, dn);
-        if (apiValid) {
-            if (dn.length()) apiDisplayName = dn;
-            prefs.begin("config", false);
-            prefs.putString("apiName", apiDisplayName);
-            prefs.end();
-        }
-    }
-    
-    setupFileSystem();  // ← AJOUTÉ : Monte LittleFS
+    setBootStage("04", "Filesystem");
+    setupFileSystem();
+    setBootStage("05", "Web server");
     setupWebServer();
+
+    setBootStage("06", "Scale");
     setupScale();
+    setBootStage("07", "RFID");
     setupRFID();
     
+    setBootStage("09", "Ready");
     displayMessage(
         "READY!",
         "IP: " + WiFi.localIP().toString(),
@@ -2190,17 +2874,63 @@ void setup() {
 void loop() {
     static unsigned long lastUpdate = 0;
     static unsigned long lastBlink = 0;
+    static unsigned long lastWifiRetry = 0;
+
+    if (otaRestartPending && millis() >= otaRestartAtMs) {
+        ESP.restart();
+    }
     
     if (millis() - lastBlink > 1000) {
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         lastBlink = millis();
     }
+
+    if (!WiFi.isConnected() && millis() - lastWifiRetry > 15000) {
+        lastWifiRetry = millis();
+        if (hasStoredWifiCredentials()) {
+            Serial.println("[WiFi] Retry stored STA connection");
+            WiFi.mode(WIFI_STA);
+            WiFi.reconnect();
+            if (WiFi.status() != WL_CONNECTED) {
+                WiFi.begin();
+            }
+        }
+    }
+
+    if (!WiFi.isConnected() && wifiPortalDeferred && !wifiPortalActive && millis() >= wifiPortalFallbackAtMs) {
+        Serial.println("[WiFi] STA retry timeout reached, starting config portal");
+        wifiPortalDeferred = false;
+        wifiPortalActive = true;
+        setBootStage("WA", "Config portal", gSetupSsid);
+        delay(1200);
+        if (!wm.startConfigPortal(gSetupSsid.c_str())) {
+            displayMessage("AP timeout", "Restarting...");
+            delay(3000);
+            ESP.restart();
+        }
+        wifiConnected = WiFi.isConnected();
+        wifiPortalActive = false;
+        if (wifiConnected) {
+            startMDNS();
+            wm.stopWebPortal();
+            wm.stopConfigPortal();
+            displayMessage(
+                "WiFi Connected!",
+                WiFi.SSID(),
+                WiFi.localIP().toString(),
+                "Starting web..."
+            );
+            delay(600);
+        }
+    }
     
     String uid = readRFID();
     if (uid.length() > 0 && uid != lastUID) {
         lastUID = uid;
-        spoolmanSyncPending = true;
-        showSpoolmanStatus("Reading", "Please wait", 6000);
+        spoolmanSyncPending = hasEnabledIntegration();
+        if (spoolmanSyncPending) {
+            showSpoolmanStatus("Reading", "Please wait", 6000);
+        }
         displayWeight(currentWeight, lastUID);
         Serial.println("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
     }
@@ -2209,19 +2939,37 @@ void loop() {
     currentWeight = weight;
 
     if (spoolmanSyncPending && lastUID.length() > 0) {
-        String spoolmanError;
         showSpoolmanStatus("Reading", "Processing...", 6000);
         displayWeight(currentWeight, lastUID);
-        Serial.printf("[Spoolman] Starting sync for UID %s at weight %.2f g\n", lastUID.c_str(), weight);
-        const bool spoolmanOk = syncWeightToSpoolman(lastUID, weight, spoolmanError);
-        if (spoolmanOk) {
-            Serial.printf("[Spoolman] Sync success for UID %s\n", lastUID.c_str());
-            showSpoolmanStatus("Spoolman OK", "Weight synced");
+        bool overallOk = true;
+        String failedName;
+        String failedError;
+
+        IntegrationConfig* integrations[] = {&spoolmanConfig, &filamanConfig};
+        for (IntegrationConfig* integration : integrations) {
+            if (!integration->enabled) continue;
+
+            String integrationError;
+            Serial.printf("[%s] Starting sync for UID %s at weight %.2f g\n", integration->name, lastUID.c_str(), weight);
+            const bool ok = syncWeightToSpoolman(*integration, lastUID, weight, integrationError);
+            if (ok) {
+                Serial.printf("[%s] Sync success for UID %s\n", integration->name, lastUID.c_str());
+            } else {
+                overallOk = false;
+                Serial.printf("[%s] Sync failed for UID %s: %s\n", integration->name, lastUID.c_str(), integrationError.c_str());
+                if (failedName.length() == 0) {
+                    failedName = integration->name;
+                    failedError = integrationError;
+                }
+            }
+        }
+
+        if (overallOk) {
+            showSpoolmanStatus("Integrations OK", "Weight synced");
         } else {
-            Serial.printf("[Spoolman] Sync failed for UID %s: %s\n", lastUID.c_str(), spoolmanError.c_str());
-            String shortErr = spoolmanError;
+            String shortErr = failedError;
             if (shortErr.length() > 18) shortErr = shortErr.substring(0, 18);
-            showSpoolmanStatus("Spoolman ERR", shortErr, 2500);
+            showSpoolmanStatus(failedName + " ERR", shortErr, 2500);
         }
         spoolmanSyncPending = false;
     }
@@ -2273,6 +3021,7 @@ void loop() {
         lastApiBroadcastMs = millis();
     }
 
+    runBackgroundConnectivityChecks();
     handleAutoPush(weight);
     
     delay(10);

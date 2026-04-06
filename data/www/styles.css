@@ -570,6 +570,41 @@ input::placeholder {
     color: #2d3748;
 }
 
+.toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    font-size: 0.9em;
+    font-weight: 600;
+    color: #2d3748;
+}
+
+.toggle-row input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    margin: 0;
+    accent-color: #667eea;
+}
+
+.ota-block {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.ota-upload-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ota-upload-row input[type="file"] {
+    padding: 10px 12px;
+    background: #f7fafc;
+}
+
 /* Responsive */
 @media (max-width: 500px) {
     .container { padding: 0 8px; }

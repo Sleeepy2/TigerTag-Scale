@@ -8,11 +8,11 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="TigerTag">
     <meta name="description" content="TigerTag Scale - Professional weight management">
-    <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" href="/favicon.png">
-    <link rel="apple-touch-icon" href="/favicon.png">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=3">
+    <link rel="icon" type="image/png" href="/favicon.png?v=3">
+    <link rel="apple-touch-icon" href="/favicon.png?v=3">
     <link rel="manifest" href="/manifest.json">
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css?v=2">
     <title>TigerTag Scale</title>
 </head>
 <body>
@@ -167,11 +167,34 @@
                 <span>Spoolman</span>
             </div>
             <div class="collapsible-content">
+                <label class="toggle-row">
+                    <span>Enable Spoolman sync</span>
+                    <input type="checkbox" id="spoolmanEnabled">
+                </label>
                 <input type="url" id="spoolmanUrl" placeholder="Spoolman URL">
                 <div style="height: 8px;"></div>
                 <input type="password" id="spoolmanToken" placeholder="Spoolman API token (optional)" autocomplete="new-password">
                 <div class="info-badge" style="margin: 12px 0;">The device will match scanned UIDs against the spool custom field `rfid_uid`.</div>
                 <button onclick="saveSpoolmanConfig()">Save Spoolman</button>
+            </div>
+        </div>
+
+        <!-- Filaman -->
+        <div class="card">
+            <div class="card-title collapsible" onclick="toggleSection(this)">
+                <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/filaman.png" alt="Filaman" style="width: 18px; height: 18px; object-fit: contain;">
+                <span>Filaman</span>
+            </div>
+            <div class="collapsible-content">
+                <label class="toggle-row">
+                    <span>Enable Filaman sync</span>
+                    <input type="checkbox" id="filamanEnabled">
+                </label>
+                <input type="url" id="filamanUrl" placeholder="Filaman URL">
+                <div style="height: 8px;"></div>
+                <input type="password" id="filamanToken" placeholder="Filaman API key" autocomplete="new-password">
+                <div class="info-badge" style="margin: 12px 0;">Filaman uses its native `/api/v1` API. Enter a Filaman user API key here.</div>
+                <button onclick="saveFilamanConfig()">Save Filaman</button>
             </div>
         </div>
 
@@ -181,6 +204,20 @@
                 ⚙️ <span data-i18n="advanced">Avancé</span>
             </div>
             <div class="collapsible-content">
+                <div class="ota-block">
+                    <div class="card-subtitle">OTA Updates</div>
+                    <div class="info-badge" style="margin-bottom: 12px;">Upload `firmware.bin` for firmware or `littlefs.bin` for the web filesystem. The device restarts automatically after a successful upload.</div>
+                    <div class="ota-upload-row">
+                        <input type="file" id="otaFirmwareFile" accept=".bin,application/octet-stream">
+                        <button class="secondary" onclick="uploadOtaImage('firmware')">Upload Firmware OTA</button>
+                    </div>
+                    <div class="ota-upload-row">
+                        <input type="file" id="otaFilesystemFile" accept=".bin,application/octet-stream">
+                        <button class="secondary" onclick="uploadOtaImage('filesystem')">Upload Filesystem OTA</button>
+                    </div>
+                    <div id="otaStatus" class="info-badge hidden" style="margin-top: 12px;"></div>
+                </div>
+                <div class="divider"></div>
                 <button class="secondary" onclick="resetWiFi()">📶 <span data-i18n="reconfigWifi">Reconfigurer Wi‑Fi</span></button>
                 <div style="height: 8px;"></div>
                 <button class="danger" onclick="factoryReset()">🗑️ <span data-i18n="factoryReset">Réinitialisation</span></button>
@@ -234,6 +271,6 @@
         </div>
     </div>
     
-    <script src="/script.js"></script>
+    <script src="/script.js?v=2"></script>
 </body>
 </html>

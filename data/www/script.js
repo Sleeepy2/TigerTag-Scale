@@ -231,7 +231,11 @@ let spoolmanPassword = '';
 let filamanEnabled = false;
 let filamanUrl = '';
 let filamanToken = '';
+let bambuddyEnabled = false;
+let bambuddyUrl = '';
+let bambuddyToken = '';
 let integrationSettingsLoaded = false;
+let lastDeviceLogText = '';
 
 // ========== UTILITIES ==========
 function setTextIfChanged(el, txt) {
@@ -255,7 +259,8 @@ function setCheckboxValue(id, value) {
 function bindIntegrationHydrationGuards() {
     const fieldIds = [
         'spoolmanEnabled', 'spoolmanUrl', 'spoolmanToken', 'spoolmanUsername', 'spoolmanPassword',
-        'filamanEnabled', 'filamanUrl', 'filamanToken'
+        'filamanEnabled', 'filamanUrl', 'filamanToken',
+        'bambuddyEnabled', 'bambuddyUrl', 'bambuddyToken'
     ];
 
     fieldIds.forEach(id => {
@@ -500,6 +505,43 @@ function saveFilamanConfig() {
         if (btn) {
             btn.disabled = false;
             btn.textContent = 'Save Filaman';
+        }
+    });
+}
+
+function saveBambuddyConfig() {
+    const enabledInput = document.getElementById('bambuddyEnabled');
+    const urlInput = document.getElementById('bambuddyUrl');
+    const tokenInput = document.getElementById('bambuddyToken');
+    const btn = document.querySelector('button[onclick="saveBambuddyConfig()"]');
+    const payload = {
+        enabled: !!(enabledInput && enabledInput.checked),
+        url: (urlInput && urlInput.value ? urlInput.value : '').trim(),
+        token: (tokenInput && tokenInput.value ? tokenInput.value : '').trim()
+    };
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
+
+    fetch('/api/bambuddy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(res => {
+        if (!res.success) throw new Error('save failed');
+        bambuddyEnabled = payload.enabled;
+        bambuddyUrl = payload.url;
+        bambuddyToken = payload.token;
+    })
+    .catch(() => alert('Error saving Bambuddy settings'))
+    .finally(() => {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save Bambuddy';
         }
     });
 }
@@ -1054,7 +1096,49 @@ function loadIntegrationSettings() {
             filamanToken = s.filamanToken;
             setInputIfIdle('filamanToken', filamanToken);
         }
+        if (typeof s.bambuddyEnabled !== 'undefined') {
+            bambuddyEnabled = !!s.bambuddyEnabled;
+            setCheckboxValue('bambuddyEnabled', bambuddyEnabled);
+        }
+        if (typeof s.bambuddyUrl === 'string') {
+            bambuddyUrl = s.bambuddyUrl;
+            setInputIfIdle('bambuddyUrl', bambuddyUrl);
+        }
+        if (typeof s.bambuddyToken === 'string') {
+            bambuddyToken = s.bambuddyToken;
+            setInputIfIdle('bambuddyToken', bambuddyToken);
+        }
         integrationSettingsLoaded = true;
+    })
+    .catch(() => {});
+}
+
+function loadDeviceLog() {
+    fetch('/api/logs', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(data => {
+        const el = document.getElementById('deviceLog');
+        if (!el || !data || !Array.isArray(data.lines)) return;
+        const text = data.lines.length ? data.lines.join('\n') : 'No device logs yet.';
+        if (text !== lastDeviceLogText) {
+            const stickToBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 20);
+            el.textContent = text;
+            lastDeviceLogText = text;
+            if (stickToBottom) {
+                el.scrollTop = el.scrollHeight;
+            }
+        }
+    })
+    .catch(() => {});
+}
+
+function clearDeviceLog() {
+    fetch('/api/logs/clear', { method: 'POST' })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(() => {
+        const el = document.getElementById('deviceLog');
+        lastDeviceLogText = 'No device logs yet.';
+        if (el) el.textContent = lastDeviceLogText;
     })
     .catch(() => {});
 }
@@ -1070,10 +1154,12 @@ window.onload = () => {
     // Once the user touches the integration form, never hydrate it again from polling.
     bindIntegrationHydrationGuards();
     loadIntegrationSettings();
+    loadDeviceLog();
     
     // Start polling
     pollStatus();
     setInterval(pollStatus, 1000);
+    setInterval(loadDeviceLog, 2000);
     
     // Register Service Worker for PWA
     if ('serviceWorker' in navigator) {

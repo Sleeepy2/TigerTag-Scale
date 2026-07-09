@@ -12,19 +12,18 @@
     <link rel="icon" type="image/png" href="/favicon.png?v=3">
     <link rel="apple-touch-icon" href="/favicon.png?v=3">
     <link rel="manifest" href="/manifest.json">
-    <link rel="stylesheet" href="/styles.css?v=2">
+    <link rel="stylesheet" href="/styles.css?v=4">
     <title>TigerTag Scale</title>
 </head>
 <body>
-    <div class="container">
-        <!-- Header -->
-        <div class="header">
+    <main class="container">
+        <header class="header">
             <h1>TigerTag</h1>
             <div class="header-right">
                 <div class="status-bar">
                     <div class="status-info">
                         <span id="cloudDot" class="status-dot"></span>
-                        <span id="cloudText" style="font-size: 0.7rem;">—</span>
+                        <span id="cloudText" style="font-size: 0.7rem;">-</span>
                     </div>
                     <div class="status-info">
                         <span id="apiDot" class="status-dot"></span>
@@ -36,241 +35,230 @@
                     <button class="lang-btn" onclick="setLanguage('fr')" data-lang="fr">FR</button>
                 </div>
             </div>
-        </div>
+        </header>
 
-        <!-- Weight Display -->
-        <div class="weight-card">
+        <section class="weight-card" aria-label="Current weight">
             <div id="userName" class="user-name hidden"></div>
             <div class="weight-display">
-                <span id="weight">—</span>
+                <span id="weight">-</span>
                 <span class="weight-unit">g</span>
             </div>
-            <div class="tag-id" id="uid" data-i18n="waiting">En attente...</div>
+            <div class="tag-id" id="uid" data-i18n="waiting">Waiting TigerTag...</div>
             <div id="sendState" class="send-status hidden"></div>
-        </div>
+        </section>
 
-        <!-- Tare Button -->
         <button id="tareBtn" class="tare-hold-btn" onmousedown="startTare()" onmouseup="cancelTare()" onmouseleave="cancelTare()" ontouchstart="startTare()" ontouchend="cancelTare()">
             <span class="tare-text" data-i18n="tare">TARE</span>
             <span class="tare-progress"></span>
         </button>
 
-        <!-- API Key -->
-        <div class="card">
-            <div class="card-title collapsible" onclick="toggleSection(this)">
-                🔑 <span data-i18n="apiKey">Clé API</span>
-            </div>
-            <div class="collapsible-content">
-                <div class="compact-row">
-                    <span class="compact-label" data-i18n="user">Utilisateur</span>
-                    <span class="compact-value" id="userDisplay">—</span>
+        <section class="settings-stack">
+            <article class="card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <span class="section-title">API Key</span>
+                </button>
+                <div class="collapsible-content">
+                    <div class="compact-row">
+                        <span class="compact-label" data-i18n="user">User</span>
+                        <span class="compact-value" id="userDisplay">-</span>
+                    </div>
+                    <div class="divider"></div>
+                    <div class="password-row">
+                        <input type="password" id="newApiKey" data-i18n-placeholder="newApiKey" placeholder="New API Key" autocomplete="new-password">
+                        <button class="eye-btn" onclick="toggleApiKeyVisibility()" type="button" title="Show or hide API key">
+                            <img id="eyeIcon" src="/img/visibility_off.svg" alt="Toggle visibility">
+                        </button>
+                    </div>
+                    <div class="button-group">
+                        <button onclick="updateApiKey()" data-i18n="update">Update</button>
+                        <button class="danger" onclick="deleteApiKey()" data-i18n="delete">Delete</button>
+                    </div>
                 </div>
-                <div class="divider"></div>
-                <div style="position: relative;">
-                    <input type="password" id="newApiKey" data-i18n-placeholder="newApiKey" placeholder="Nouvelle clé API" autocomplete="new-password" style="padding-right: 50px;">
-                    <button class="eye-btn" onclick="toggleApiKeyVisibility()" type="button" title="Afficher/Masquer">
-                        <img id="eyeIcon" src="/img/visibility_off.svg" alt="Toggle visibility" style="width: 20px; height: 20px;">
-                    </button>
-                </div>
-                <div class="button-group">
-                    <button onclick="updateApiKey()" data-i18n="update">Mettre à jour</button>
-                    <button class="danger" onclick="deleteApiKey()" data-i18n="delete">Supprimer</button>
-                </div>
-            </div>
-        </div>
+            </article>
 
-        <!-- Calibration -->
-        <div class="card">
-            <div class="card-title collapsible" onclick="toggleSection(this)">
-                ✨ <span data-i18n="calibration">Calibration</span>
-            </div>
-            <div class="collapsible-content">
-                <!-- Calibration Wizard -->
-                <div id="calibWizard">
-                    <!-- Progress indicator -->
-                    <div class="progress-dots">
-                        <span class="dot active" data-step="1"></span>
-                        <span class="dot" data-step="2"></span>
-                        <span class="dot" data-step="3"></span>
-                    </div>
-                    
-                    <!-- Step 1: Empty scale -->
-                    <div id="step1" class="calib-step active">
-                        <div class="step-icon">⚖️</div>
-                        <div class="step-instruction" data-i18n="step1Instruction">Retirez le filament de la balance</div>
-                        <button onclick="calibStep1()" data-i18n="step1Button">Step 2 →</button>
-                    </div>
-                    
-                    <!-- Step 2: Place known weight -->
-                    <div id="step2" class="calib-step">
-                        <!-- Close button (X) -->
-                        <button class="close-btn" onclick="calibBack(1)" title="Retour">✕</button>
-                        
-                        <!-- Masterspool image (replaces 📦 emoji) -->
-                        <div id="masterspoolImageMain" class="masterspool-image-main">
-                            <img id="masterspoolImg" src="" alt="Masterspool">
+            <article class="card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <span class="section-title" data-i18n="calibration">Wizard Calibration</span>
+                </button>
+                <div class="collapsible-content">
+                    <div id="calibWizard">
+                        <div class="progress-dots">
+                            <span class="dot active" data-step="1"></span>
+                            <span class="dot" data-step="2"></span>
+                            <span class="dot" data-step="3"></span>
                         </div>
-                        
-                        <div class="step-instruction" data-i18n="step2Instruction">Sélectionnez votre Masterspool vide et placez-la sur la balance</div>
-                        
-                        <!-- Masterspool selector -->
-                        <div class="masterspool-selector">
-                            <label data-i18n="selectMasterspool" style="font-size: 0.9em; color: #4a5568; margin-bottom: 8px; display: block;">Sélectionnez votre Masterspool</label>
-                            <select id="masterspoolSelect" onchange="onMasterspoolChange()" style="width: 100%; padding: 12px; border: 2px solid #e2e8f0; border-radius: 10px; font-size: 0.95em; background: #fff; margin-bottom: 12px;">
-                                <!-- Options will be populated by JavaScript -->
-                            </select>
-                            
-                            <!-- Custom weight input (shown only when Custom is selected) -->
-                            <input type="number" id="calibKnownWeight" data-i18n-placeholder="calibKnownWeight" placeholder="Poids réel (g)" step="0.1" min="0.1" inputmode="decimal" style="font-size: 1.1em; padding: 16px; text-align: center; font-weight: 600; background: #fff; display: none;">
-                            <div id="calibWeightError" class="error-message" style="display: none;">
-                                <span data-i18n="errorWeightRequired">⚠️ Veuillez entrer un poids valide (min. 200g)</span>
+
+                        <div id="step1" class="calib-step active">
+                            <div class="step-instruction" data-i18n="step1Instruction">Leave the scale empty then press the button</div>
+                            <button onclick="calibStep1()" data-i18n="step1Button">GO</button>
+                        </div>
+
+                        <div id="step2" class="calib-step">
+                            <button class="close-btn" onclick="calibBack(1)" title="Back" type="button">x</button>
+                            <div id="masterspoolImageMain" class="masterspool-image-main">
+                                <img id="masterspoolImg" src="" alt="Masterspool">
+                            </div>
+                            <div class="step-instruction" data-i18n="step2Instruction">Select your empty Masterspool and place it on the scale</div>
+                            <div class="masterspool-selector">
+                                <label data-i18n="selectMasterspool">Select your Masterspool</label>
+                                <select id="masterspoolSelect" onchange="onMasterspoolChange()"></select>
+                                <input type="number" id="calibKnownWeight" data-i18n-placeholder="calibKnownWeight" placeholder="Real weight (g)" step="0.1" min="0.1" inputmode="decimal">
+                                <div id="calibWeightError" class="error-message" style="display: none;">
+                                    <span data-i18n="errorWeightRequired">Please enter a valid weight (min. 200g)</span>
+                                </div>
+                            </div>
+                            <div class="button-group">
+                                <button id="tareBtnCalib" class="tare-hold-btn" onmousedown="startTareCalib()" onmouseup="cancelTareCalib()" onmouseleave="cancelTareCalib()" ontouchstart="startTareCalib()" ontouchend="cancelTareCalib()">
+                                    <span class="tare-text" data-i18n="tare">TARE</span>
+                                    <span class="tare-progress"></span>
+                                </button>
+                                <button onclick="calibStep2()" data-i18n="step2Button">Calibrate</button>
                             </div>
                         </div>
-                        
-                        <div class="button-group" style="grid-template-columns: 1fr 1fr;">
-                            <button id="tareBtnCalib" class="tare-hold-btn" onmousedown="startTareCalib()" onmouseup="cancelTareCalib()" onmouseleave="cancelTareCalib()" ontouchstart="startTareCalib()" ontouchend="cancelTareCalib()">
-                                <span class="tare-text" data-i18n="tare">TARE</span>
-                                <span class="tare-progress"></span>
-                            </button>
-                            <button onclick="calibStep2()" data-i18n="step2Button">Calibrer ✓</button>
+
+                        <div id="step3" class="calib-step">
+                            <div class="step-instruction" data-i18n="step3Instruction">The scale is now calibrated</div>
+                            <button class="secondary" onclick="calibReset()" data-i18n="calibAgain">Restart</button>
                         </div>
                     </div>
-                    
-                    <!-- Step 3: Success -->
-                    <div id="step3" class="calib-step">
-                        <div class="step-icon">✨</div>
-                        <div class="step-instruction" data-i18n="step3Instruction">La balance est maintenant calibrée</div>
-                        <button class="secondary" onclick="calibReset()" data-i18n="calibAgain">Calibrer à nouveau</button>
+
+                    <div class="divider"></div>
+                    <button class="card-subtitle collapsible subsection-toggle" onclick="toggleSection(this)" type="button">
+                        <span data-i18n="manualCalib">Manual calibration</span>
+                    </button>
+                    <div class="collapsible-content">
+                        <div class="info-badge">
+                            <span data-i18n="currentFactor">Current factor</span>: <strong id="calFactor">-</strong>
+                        </div>
+                        <input type="number" id="newCalFactor" data-i18n-placeholder="newFactor" placeholder="New factor" step="0.1" min="0.1">
+                        <button class="secondary" onclick="updateCalibration()" data-i18n="apply">Apply</button>
                     </div>
                 </div>
-                
-                <div class="divider"></div>
-                
-                <!-- Manual calibration (collapsed by default) -->
-                <div class="card-subtitle collapsible" onclick="toggleSection(this)" style="cursor: pointer;">
-                    ✏️ <span data-i18n="manualCalib">Calibration manuelle</span>
-                </div>
+            </article>
+
+            <article class="card integration-card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/spoolman.svg" alt="Spoolman">
+                    <span class="section-title">Spoolman</span>
+                </button>
                 <div class="collapsible-content">
-                    <div class="info-badge" style="margin-bottom: 12px;">
-                        <span data-i18n="currentFactor">Facteur actuel</span>: <strong id="calFactor">—</strong>
-                    </div>
-                    <input type="number" id="newCalFactor" data-i18n-placeholder="newFactor" placeholder="Nouveau facteur" step="0.1" min="0.1">
-                    <button class="secondary" onclick="updateCalibration()" data-i18n="apply">Appliquer</button>
+                    <label class="toggle-row">
+                        <span>Enable Spoolman sync</span>
+                        <input type="checkbox" id="spoolmanEnabled">
+                    </label>
+                    <input type="url" id="spoolmanUrl" placeholder="Spoolman URL">
+                    <input type="password" id="spoolmanToken" placeholder="Spoolman API token (optional)" autocomplete="new-password">
+                    <div class="info-badge">Matches scanned UIDs against the spool custom field <code>rfid_uid</code>.</div>
+                    <button onclick="saveSpoolmanConfig()">Save Spoolman</button>
                 </div>
-            </div>
-        </div>
+            </article>
 
-        <!-- Spoolman -->
-        <div class="card">
-            <div class="card-title collapsible" onclick="toggleSection(this)">
-                <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/spoolman.svg" alt="Spoolman" style="width: 18px; height: 18px; object-fit: contain;">
-                <span>Spoolman</span>
-            </div>
-            <div class="collapsible-content">
-                <label class="toggle-row">
-                    <span>Enable Spoolman sync</span>
-                    <input type="checkbox" id="spoolmanEnabled">
-                </label>
-                <input type="url" id="spoolmanUrl" placeholder="Spoolman URL">
-                <div style="height: 8px;"></div>
-                <input type="password" id="spoolmanToken" placeholder="Spoolman API token (optional)" autocomplete="new-password">
-                <div class="info-badge" style="margin: 12px 0;">The device will match scanned UIDs against the spool custom field `rfid_uid`.</div>
-                <button onclick="saveSpoolmanConfig()">Save Spoolman</button>
-            </div>
-        </div>
-
-        <!-- Filaman -->
-        <div class="card">
-            <div class="card-title collapsible" onclick="toggleSection(this)">
-                <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/filaman.png" alt="Filaman" style="width: 18px; height: 18px; object-fit: contain;">
-                <span>Filaman</span>
-            </div>
-            <div class="collapsible-content">
-                <label class="toggle-row">
-                    <span>Enable Filaman sync</span>
-                    <input type="checkbox" id="filamanEnabled">
-                </label>
-                <input type="url" id="filamanUrl" placeholder="Filaman URL">
-                <div style="height: 8px;"></div>
-                <input type="password" id="filamanToken" placeholder="Filaman API key" autocomplete="new-password">
-                <div class="info-badge" style="margin: 12px 0;">Filaman uses its native `/api/v1` API. Enter a Filaman user API key here.</div>
-                <button onclick="saveFilamanConfig()">Save Filaman</button>
-            </div>
-        </div>
-
-        <!-- Advanced -->
-        <div class="card">
-            <div class="card-title collapsible" onclick="toggleSection(this)">
-                ⚙️ <span data-i18n="advanced">Avancé</span>
-            </div>
-            <div class="collapsible-content">
-                <div class="ota-block">
-                    <div class="card-subtitle">OTA Updates</div>
-                    <div class="info-badge" style="margin-bottom: 12px;">Upload `firmware.bin` for firmware or `littlefs.bin` for the web filesystem. The device restarts automatically after a successful upload.</div>
-                    <div class="ota-upload-row">
-                        <input type="file" id="otaFirmwareFile" accept=".bin,application/octet-stream">
-                        <button class="secondary" onclick="uploadOtaImage('firmware')">Upload Firmware OTA</button>
-                    </div>
-                    <div class="ota-upload-row">
-                        <input type="file" id="otaFilesystemFile" accept=".bin,application/octet-stream">
-                        <button class="secondary" onclick="uploadOtaImage('filesystem')">Upload Filesystem OTA</button>
-                    </div>
-                    <div id="otaStatus" class="info-badge hidden" style="margin-top: 12px;"></div>
+            <article class="card integration-card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/filaman.png" alt="Filaman">
+                    <span class="section-title">Filaman</span>
+                </button>
+                <div class="collapsible-content">
+                    <label class="toggle-row">
+                        <span>Enable Filaman sync</span>
+                        <input type="checkbox" id="filamanEnabled">
+                    </label>
+                    <input type="url" id="filamanUrl" placeholder="Filaman URL">
+                    <input type="password" id="filamanToken" placeholder="Filaman API or device token" autocomplete="new-password">
+                    <div class="info-badge">Uses native <code>/api/v1</code>. <code>uak...</code> is sent as ApiKey, <code>dev...</code> as Device.</div>
+                    <button onclick="saveFilamanConfig()">Save Filaman</button>
                 </div>
-                <div class="divider"></div>
-                <button class="secondary" onclick="resetWiFi()">📶 <span data-i18n="reconfigWifi">Reconfigurer Wi‑Fi</span></button>
-                <div style="height: 8px;"></div>
-                <button class="danger" onclick="factoryReset()">🗑️ <span data-i18n="factoryReset">Réinitialisation</span></button>
-                <div class="divider"></div>
-                <div class="compact-row">
-                    <span class="compact-label" data-i18n="uptime">Durée de fonctionnement</span>
-                    <span class="compact-value" id="uptime">--:--:--</span>
+            </article>
+
+            <article class="card integration-card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <img src="https://cdn.jsdelivr.net/gh/selfhst/icons/png/bambuddy.png" alt="Bambuddy">
+                    <span class="section-title">Bambuddy</span>
+                </button>
+                <div class="collapsible-content">
+                    <label class="toggle-row">
+                        <span>Enable Bambuddy sync</span>
+                        <input type="checkbox" id="bambuddyEnabled">
+                    </label>
+                    <input type="url" id="bambuddyUrl" placeholder="Bambuddy URL">
+                    <input type="password" id="bambuddyToken" placeholder="Bambuddy API key" autocomplete="new-password">
+                    <div class="info-badge">Uses <code>X-API-Key</code> auth and links spools by the scanned tag hex UID.</div>
+                    <button onclick="saveBambuddyConfig()">Save Bambuddy</button>
                 </div>
-            </div>
-        </div>
-        
-        <!-- Footer -->
-        <div class="footer">
+            </article>
+
+            <article class="card">
+                <button class="card-title collapsible" onclick="toggleSection(this)" type="button">
+                    <span class="section-title" data-i18n="advanced">Advanced</span>
+                </button>
+                <div class="collapsible-content">
+                    <section class="settings-group">
+                        <div class="card-subtitle">OTA Updates</div>
+                        <div class="info-badge">Upload <code>firmware.bin</code> or <code>littlefs.bin</code>. The device restarts after a successful upload.</div>
+                        <div class="ota-upload-row">
+                            <input type="file" id="otaFirmwareFile" accept=".bin,application/octet-stream">
+                            <button class="secondary" onclick="uploadOtaImage('firmware')">Upload Firmware OTA</button>
+                        </div>
+                        <div class="ota-upload-row">
+                            <input type="file" id="otaFilesystemFile" accept=".bin,application/octet-stream">
+                            <button class="secondary" onclick="uploadOtaImage('filesystem')">Upload Filesystem OTA</button>
+                        </div>
+                        <div id="otaStatus" class="info-badge hidden"></div>
+                    </section>
+
+                    <div class="divider"></div>
+
+                    <section class="settings-group">
+                        <button class="secondary" onclick="resetWiFi()"><span data-i18n="reconfigWifi">Reconfigure Wi-Fi</span></button>
+                        <button class="danger" onclick="factoryReset()"><span data-i18n="factoryReset">Factory Reset</span></button>
+                    </section>
+
+                    <div class="divider"></div>
+
+                    <section class="log-panel full-bleed" aria-label="Device log">
+                        <div class="log-panel-header">
+                            <div class="card-subtitle">Device Log</div>
+                            <button class="secondary log-clear-btn" onclick="clearDeviceLog()">Clear Log</button>
+                        </div>
+                        <pre id="deviceLog" class="device-log-output">Waiting for device logs...</pre>
+                    </section>
+
+                    <div class="divider"></div>
+                    <div class="compact-row">
+                        <span class="compact-label" data-i18n="uptime">Uptime</span>
+                        <span class="compact-value" id="uptime">--:--:--</span>
+                    </div>
+                </div>
+            </article>
+        </section>
+
+        <footer class="footer">
             <div class="footer-version">
-                <a href="https://tigertag.io" target="_blank" rel="noopener noreferrer" style="color: #a0aec0; text-decoration: none; transition: color 0.2s;">TigerTag.io</a>
+                <a href="https://tigertag.io" target="_blank" rel="noopener noreferrer">TigerTag.io</a>
             </div>
             <div class="footer-links">
-                <a href="https://github.com/TigerTag-Project/TigerTag-RFID-Guide" target="_blank" rel="noopener noreferrer" class="footer-link">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                    </svg>
-                    RFID Guide
-                </a>
-                <a href="https://discord.gg/3Qv5TSqnJH" target="_blank" rel="noopener noreferrer" class="footer-link">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515a.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0a12.64 12.64 0 0 0-.617-1.25a.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057a19.9 19.9 0 0 0 5.993 3.03a.078.078 0 0 0 .084-.028a14.09 14.09 0 0 0 1.226-1.994a.076.076 0 0 0-.041-.106a13.107 13.107 0 0 1-1.872-.892a.077.077 0 0 1-.008-.128a10.2 10.2 0 0 0 .372-.292a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127a12.299 12.299 0 0 1-1.873.892a.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028a19.839 19.839 0 0 0 6.002-3.03a.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419c0-1.333.956-2.419 2.157-2.419c1.21 0 2.176 1.096 2.157 2.42c0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419c0-1.333.955-2.419 2.157-2.419c1.21 0 2.176 1.096 2.157 2.42c0 1.333-.946 2.418-2.157 2.418z"/>
-                    </svg>
-                    Discord
-                </a>
+                <a href="https://github.com/TigerTag-Project/TigerTag-RFID-Guide" target="_blank" rel="noopener noreferrer" class="footer-link">RFID Guide</a>
+                <a href="https://discord.gg/3Qv5TSqnJH" target="_blank" rel="noopener noreferrer" class="footer-link">Discord</a>
             </div>
-        </div>
-    </div>
+        </footer>
+    </main>
 
-    <!-- Modal for weight too light error -->
     <div id="weightErrorModal" class="modal">
         <div class="modal-content">
-            <div class="modal-icon">⚠️</div>
-            <h3 class="modal-title" data-i18n="modalWeightTooLightTitle">Poids insuffisant</h3>
-            <p class="modal-message" data-i18n="modalWeightTooLightMessage">Le poids est trop léger pour une calibration. Utilisez une Masterspool ou un filament d'au moins 200g.</p>
+            <h3 class="modal-title" data-i18n="modalWeightTooLightTitle">Insufficient weight</h3>
+            <p class="modal-message" data-i18n="modalWeightTooLightMessage">The weight is too light for calibration. Use a Masterspool or filament of at least 200g.</p>
             <button class="modal-btn" onclick="closeWeightErrorModal()" data-i18n="modalOk">OK</button>
         </div>
     </div>
 
-    <!-- Modal for invalid weight error -->
     <div id="weightInvalidModal" class="modal">
         <div class="modal-content">
-            <div class="modal-icon">⚠️</div>
-            <h3 class="modal-title" data-i18n="modalWeightInvalidTitle">Poids invalide</h3>
-            <p class="modal-message" data-i18n="modalWeightInvalidMessage">Veuillez entrer un poids valide</p>
+            <h3 class="modal-title" data-i18n="modalWeightInvalidTitle">Invalid weight</h3>
+            <p class="modal-message" data-i18n="modalWeightInvalidMessage">Please enter a valid weight</p>
             <button class="modal-btn" onclick="closeWeightInvalidModal()" data-i18n="modalOk">OK</button>
         </div>
     </div>
-    
-    <script src="/script.js?v=2"></script>
+
+    <script src="/script.js?v=4"></script>
 </body>
 </html>

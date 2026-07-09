@@ -17,6 +17,12 @@ body {
     margin: 0 auto; 
 }
 
+.settings-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
 /* Header */
 .header {
     background: #fff;
@@ -161,6 +167,11 @@ body {
 }
 
 .card-title {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
     font-size: 0.95em;
     font-weight: 600;
     color: #1a202c;
@@ -168,12 +179,45 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
+    text-align: left;
+}
+
+.card-title:hover {
+    transform: none;
+    box-shadow: none;
+    background: transparent;
+}
+
+.card-title img {
+    width: 18px;
+    height: 18px;
+    object-fit: contain;
+    flex: 0 0 auto;
+}
+
+.section-title {
+    flex: 1 1 auto;
 }
 
 .card-subtitle {
     font-size: 0.8em;
     color: #718096;
     margin-bottom: 12px;
+}
+
+.subsection-toggle {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #718096;
+    text-align: left;
+}
+
+.subsection-toggle:hover {
+    transform: none;
+    box-shadow: none;
+    background: transparent;
 }
 
 /* Buttons */
@@ -338,6 +382,14 @@ input.error {
 }
 
 /* Eye button for password toggle */
+.password-row {
+    position: relative;
+}
+
+.password-row input {
+    padding-right: 50px;
+}
+
 .eye-btn {
     position: absolute;
     right: 8px;
@@ -401,13 +453,12 @@ input::placeholder {
 }
 
 .collapsible-content {
-    max-height: 0;
-    overflow: hidden;
-    transition: max-height 0.3s ease;
+    display: none;
+    overflow: visible;
 }
 
 .collapsible-content.active {
-    max-height: 800px;
+    display: block;
     padding-top: 12px;
 }
 
@@ -443,6 +494,32 @@ input::placeholder {
 
 .masterspool-selector {
     margin: 16px 0;
+}
+
+.masterspool-selector label {
+    display: block;
+    font-size: 0.9em;
+    color: #4a5568;
+    margin-bottom: 8px;
+}
+
+.masterspool-selector select {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid #e2e8f0;
+    border-radius: 10px;
+    font-size: 0.95em;
+    background: #fff;
+    margin-bottom: 12px;
+}
+
+#calibKnownWeight {
+    display: none;
+    font-size: 1.1em;
+    padding: 16px;
+    text-align: center;
+    font-weight: 600;
+    background: #fff;
 }
 
 .masterspool-image-main {
@@ -594,6 +671,12 @@ input::placeholder {
     gap: 10px;
 }
 
+.settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
 .ota-upload-row {
     display: flex;
     flex-direction: column;
@@ -603,6 +686,59 @@ input::placeholder {
 .ota-upload-row input[type="file"] {
     padding: 10px 12px;
     background: #f7fafc;
+}
+
+.full-bleed {
+    width: 100vw;
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+}
+
+.log-panel {
+    background: #0f172a;
+    border-radius: 0;
+    padding: 14px;
+    color: #e2e8f0;
+    overflow: visible;
+}
+
+.log-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.log-panel-header .card-subtitle {
+    color: #cbd5e1;
+}
+
+.log-clear-btn {
+    width: auto;
+    padding: 8px 12px;
+    font-size: 0.85em;
+    flex: 0 0 auto;
+}
+
+.device-log-output {
+    display: block;
+    width: 100%;
+    min-height: 220px;
+    max-height: 65vh;
+    margin: 0;
+    overflow: scroll;
+    white-space: pre;
+    word-break: normal;
+    overflow-wrap: normal;
+    background: #020617;
+    color: #e2e8f0;
+    border: 1px solid #1e293b;
+    border-radius: 12px;
+    padding: 14px;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 0.83em;
+    line-height: 1.45;
 }
 
 /* Responsive */
@@ -619,6 +755,18 @@ input::placeholder {
     }
     .weight-display { font-size: 3em; }
     .button-group { grid-template-columns: 1fr; }
+    .full-bleed {
+        width: 100vw;
+        margin-left: calc(50% - 50vw);
+        margin-right: calc(50% - 50vw);
+    }
+    .log-panel-header {
+        align-items: stretch;
+        flex-direction: column;
+    }
+    .log-clear-btn {
+        width: 100%;
+    }
 }
 
 /* Hide elements */

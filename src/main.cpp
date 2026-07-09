@@ -23,6 +23,8 @@
 #include <Update.h>
 #include <esp_wifi.h>
 #include <math.h>
+#include <memory>
+#include <stdarg.h>
 
 // ============================================================================
 // CONFIGURATION MATERIELLE
@@ -102,6 +104,7 @@ struct IntegrationConfig {
 
 IntegrationConfig spoolmanConfig = {"Spoolman", "/api/v1", false, "", "", "", ""};
 IntegrationConfig filamanConfig = {"Filaman", "/api/v1", false, "", "", "", ""};
+IntegrationConfig bambuddyConfig = {"Bambuddy", "/api/v1", false, "", "", "", ""};
 float calibrationFactor = 406;
 float currentWeight = 0.0;
 // --- Hold mode variables ---
@@ -161,6 +164,10 @@ bool otaRestartPending = false;
 uint32_t otaRestartAtMs = 0;
 String autoPushUid = "";
 uint8_t autoPushAttempts = 0;
+const size_t DEVICE_LOG_CAPACITY = 120;
+String deviceLogLines[DEVICE_LOG_CAPACITY];
+size_t deviceLogStart = 0;
+size_t deviceLogCount = 0;
 
 struct TigerTagData {
     bool valid = false;
@@ -212,6 +219,77 @@ struct TigerTagResolvedMeta {
     String materialName;
     String aspect1Name;
 };
+
+static String formatLogTimestamp(uint32_t ms) {
+    uint32_t totalSeconds = ms / 1000UL;
+    uint32_t hours = (totalSeconds / 3600UL) % 100UL;
+    uint32_t minutes = (totalSeconds / 60UL) % 60UL;
+    uint32_t seconds = totalSeconds % 60UL;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "[%02lu:%02lu:%02lu]", (unsigned long)hours, (unsigned long)minutes, (unsigned long)seconds);
+    return String(buf);
+}
+
+static void appendDeviceLogLine(const String& rawLine) {
+    String line = rawLine;
+    line.replace("\r", "");
+    int start = 0;
+    while (start <= line.length()) {
+        int nl = line.indexOf('\n', start);
+        String part = nl >= 0 ? line.substring(start, nl) : line.substring(start);
+        part.trim();
+        if (part.length() > 0) {
+            if (part.length() > 240) {
+                part = part.substring(0, 237) + "...";
+            }
+            String stamped = formatLogTimestamp(millis()) + " " + part;
+            size_t slot = (deviceLogStart + deviceLogCount) % DEVICE_LOG_CAPACITY;
+            deviceLogLines[slot] = stamped;
+            if (deviceLogCount < DEVICE_LOG_CAPACITY) {
+                deviceLogCount++;
+            } else {
+                deviceLogStart = (deviceLogStart + 1) % DEVICE_LOG_CAPACITY;
+            }
+        }
+        if (nl < 0) break;
+        start = nl + 1;
+    }
+}
+
+static void clearDeviceLogs() {
+    for (size_t i = 0; i < DEVICE_LOG_CAPACITY; ++i) deviceLogLines[i] = "";
+    deviceLogStart = 0;
+    deviceLogCount = 0;
+}
+
+static void deviceLogln(const String& line) {
+    Serial.println(line);
+    appendDeviceLogLine(line);
+}
+
+static void deviceLogf(const char* fmt, ...) {
+    char stackBuf[384];
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(stackBuf, sizeof(stackBuf), fmt, args);
+    va_end(args);
+
+    String line;
+    if (written < 0) {
+        line = "[log format error]";
+    } else if ((size_t)written < sizeof(stackBuf)) {
+        line = String(stackBuf);
+    } else {
+        std::unique_ptr<char[]> heapBuf(new char[(size_t)written + 1]);
+        va_start(args, fmt);
+        vsnprintf(heapBuf.get(), (size_t)written + 1, fmt, args);
+        va_end(args);
+        line = String(heapBuf.get());
+    }
+
+    Serial.print(line);
+    appendDeviceLogLine(line);
+}
 
 // ============================================================================
 // AFFICHAGE OLED
@@ -281,6 +359,7 @@ String buildIntegrationApiBase(const IntegrationConfig& config);
 static String formatHttpFailure(int code, const String& resp);
 static String jsonEscape(const String& input);
 bool isFilamanIntegration(const IntegrationConfig& config);
+bool isBambuddyIntegration(const IntegrationConfig& config);
 String findSpoolmanSpoolIdByUid(const IntegrationConfig& config, const String& uid, String& errorOut);
 bool fetchTigerTagProductInfo(const String& uid, uint32_t productId, TigerTagProductInfo& infoOut, String& errorOut);
 bool fetchTigerTagResolvedMeta(const TigerTagData& tagData, TigerTagResolvedMeta& metaOut, String& errorOut);
@@ -293,6 +372,7 @@ bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, fl
 void saveIntegrationConfig();
 void resetAutoPushState(bool clearUid);
 bool isFilamanIntegration(const IntegrationConfig& config);
+bool isBambuddyIntegration(const IntegrationConfig& config);
 static bool connectStoredWifi(uint32_t timeoutMs, bool disconnectFirst, const String& statusLine2);
 static bool hasStoredWifiCredentials();
 
@@ -312,6 +392,7 @@ static uint8_t chooseTextSizeForWidth(const String& text, uint8_t preferredSize,
 static void prepareSpoolmanHttp(HTTPClient& http) {
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 }
 
 struct FilamanSessionState {
@@ -338,6 +419,33 @@ static String extractCookieValue(const String& headerValue, const char* name) {
     int end = headerValue.indexOf(';', start);
     if (end < 0) end = headerValue.length();
     return headerValue.substring(start, end);
+}
+
+static String buildFilamanAuthHeader(const String& rawToken) {
+    String token = rawToken;
+    token.trim();
+    if (token.length() == 0) return "";
+
+    if (token.startsWith("ApiKey ") || token.startsWith("Device ") || token.startsWith("Bearer ")) {
+        return token;
+    }
+    if (token.startsWith("uak.")) {
+        return "ApiKey " + token;
+    }
+    if (token.startsWith("dev.")) {
+        return "Device " + token;
+    }
+    if (token.startsWith("eyJ")) {
+        return "Bearer " + token;
+    }
+    return "ApiKey " + token;
+}
+
+static String buildTigerTagHexUid() {
+    String hexUid = lastUIDHex;
+    hexUid.trim();
+    hexUid.toUpperCase();
+    return hexUid;
 }
 
 static bool ensureFilamanSession(const IntegrationConfig& config, String& errorOut) {
@@ -400,9 +508,16 @@ static bool ensureFilamanSession(const IntegrationConfig& config, String& errorO
 }
 
 static void addIntegrationAuthHeader(HTTPClient& http, const IntegrationConfig& config) {
+    if (isBambuddyIntegration(config)) {
+        if (config.token.length() > 0) {
+            http.addHeader("X-API-Key", config.token);
+        }
+        return;
+    }
+
     if (isFilamanIntegration(config)) {
         if (config.token.length() > 0) {
-            http.addHeader("Authorization", "ApiKey " + config.token);
+            http.addHeader("Authorization", buildFilamanAuthHeader(config.token));
             return;
         }
         if (filamanSession.cookieHeader.length() > 0) {
@@ -411,7 +526,6 @@ static void addIntegrationAuthHeader(HTTPClient& http, const IntegrationConfig& 
         if (filamanSession.csrfToken.length() > 0) {
             http.addHeader("X-CSRF-Token", filamanSession.csrfToken);
         }
-        setBootStage("F2", "LittleFS missing", "/www not found");
         return;
     }
 
@@ -434,11 +548,15 @@ static bool prepareIntegrationRequest(HTTPClient& http, const IntegrationConfig&
 }
 
 static bool hasEnabledIntegration() {
-    return spoolmanConfig.enabled || filamanConfig.enabled;
+    return spoolmanConfig.enabled || filamanConfig.enabled || bambuddyConfig.enabled;
 }
 
 bool isFilamanIntegration(const IntegrationConfig& config) {
     return String(config.name) == "Filaman";
+}
+
+bool isBambuddyIntegration(const IntegrationConfig& config) {
+    return String(config.name) == "Bambuddy";
 }
 
 static String formatHttpFailure(int code, const String& resp) {
@@ -721,6 +839,11 @@ static bool readTigerTagData(TigerTagData& dataOut, String& errorOut) {
 String normalizeSpoolmanBaseUrl(const String& raw) {
     String value = raw;
     value.trim();
+    if (value.length() > 0 &&
+        value.indexOf("://") < 0 &&
+        !value.startsWith("/")) {
+        value = "http://" + value;
+    }
     while (value.endsWith("/")) value.remove(value.length() - 1);
     return value;
 }
@@ -749,6 +872,9 @@ void saveIntegrationConfig() {
     prefs.putString("filamanToken", filamanConfig.token);
     prefs.putString("filamanUsername", filamanConfig.username);
     prefs.putString("filamanPassword", filamanConfig.password);
+    prefs.putBool("bambuddyEnabled", bambuddyConfig.enabled);
+    prefs.putString("bambuddyUrl", bambuddyConfig.url);
+    prefs.putString("bambuddyToken", bambuddyConfig.token);
     prefs.end();
 }
 
@@ -948,7 +1074,7 @@ String ensureSpoolmanVendor(const IntegrationConfig& config, const String& vendo
     HTTPClient http;
     const String baseUrl = buildIntegrationApiBase(config);
     const String url = isFilamanIntegration(config) ? baseUrl + "/manufacturers" : baseUrl + "/vendor";
-    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
+    deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
@@ -1161,7 +1287,7 @@ String ensureSpoolmanFilament(const IntegrationConfig& config, const String& uid
     HTTPClient http;
     const String baseUrl = buildIntegrationApiBase(config);
     const String url = isFilamanIntegration(config) ? baseUrl + "/filaments" : baseUrl + "/filament";
-    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
+    deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
@@ -1222,7 +1348,7 @@ String createSpoolmanSpool(const IntegrationConfig& config, const String& uid, c
     HTTPClient http;
     const String baseUrl = buildIntegrationApiBase(config);
     const String url = isFilamanIntegration(config) ? baseUrl + "/spools" : baseUrl + "/spool";
-    Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
+    deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
     if (!http.begin(url)) {
         errorOut = "http begin failed";
         return "";
@@ -1249,7 +1375,281 @@ String createSpoolmanSpool(const IntegrationConfig& config, const String& uid, c
     }
 
     String spoolId = String((int)responseDoc["id"]);
-    Serial.printf("[%s] Created spool %s for UID %s\n", config.name, spoolId.c_str(), uid.c_str());
+    deviceLogf("[%s] Created spool %s for UID %s\n", config.name, spoolId.c_str(), uid.c_str());
+    return spoolId;
+}
+
+static bool findBambuddySpoolByUid(
+    const IntegrationConfig& config,
+    const String& uid,
+    String& spoolIdOut,
+    int& labelWeightOut,
+    String& errorOut
+) {
+    spoolIdOut = "";
+    labelWeightOut = 1000;
+    errorOut = "";
+
+    const String baseUrl = buildIntegrationApiBase(config);
+    if (baseUrl.length() == 0) {
+        errorOut = String(config.name) + " url missing";
+        return false;
+    }
+
+    String tagUidHex = buildTigerTagHexUid();
+    if (tagUidHex.length() == 0) {
+        errorOut = "missing tag hex uid";
+        return false;
+    }
+
+    HTTPClient http;
+    const String url = baseUrl + "/inventory/spools/by-tag/" + urlEncode(tagUidHex);
+    deviceLogf("[%s] Lookup UID %s (hex %s) via %s\n", config.name, uid.c_str(), tagUidHex.c_str(), url.c_str());
+    prepareSpoolmanHttp(http);
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return false;
+    }
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return false;
+    }
+
+    const int code = http.GET();
+    const String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        if (code != 404 && code != 405) {
+            errorOut = formatHttpFailure(code, resp);
+            return false;
+        }
+    }
+
+    if (code >= 200 && code < 300) {
+        DynamicJsonDocument doc(2048);
+        DeserializationError err = deserializeJson(doc, resp);
+        if (err) {
+            errorOut = String("json parse failed: ") + err.c_str();
+            return false;
+        }
+
+        String spoolTagUid = getJsonStringValue(doc["tag_uid"]);
+        spoolTagUid.toUpperCase();
+        if (spoolTagUid != tagUidHex) {
+            errorOut = "bambuddy by-tag lookup returned mismatched tag_uid";
+            return false;
+        }
+
+        spoolIdOut = String((int)doc["id"]);
+        labelWeightOut = doc["label_weight"] | 1000;
+        return true;
+    }
+
+    // Fallback for older Bambuddy versions that may not expose /by-tag/.
+    HTTPClient fallbackHttp;
+    const String fallbackUrl = baseUrl + "/inventory/spools?include_archived=true";
+    deviceLogf("[%s] Fallback lookup UID %s (hex %s) via %s\n", config.name, uid.c_str(), tagUidHex.c_str(), fallbackUrl.c_str());
+    prepareSpoolmanHttp(fallbackHttp);
+    if (!fallbackHttp.begin(fallbackUrl)) {
+        errorOut = "http begin failed";
+        return false;
+    }
+    if (!prepareIntegrationRequest(fallbackHttp, config, errorOut)) {
+        fallbackHttp.end();
+        return false;
+    }
+
+    const int fallbackCode = fallbackHttp.GET();
+    const String fallbackResp = fallbackHttp.getString();
+    fallbackHttp.end();
+    if (fallbackCode < 200 || fallbackCode >= 300) {
+        errorOut = formatHttpFailure(fallbackCode, fallbackResp);
+        return false;
+    }
+
+    DynamicJsonDocument filter(256);
+    JsonObject filterItem = filter.createNestedObject();
+    filterItem["id"] = true;
+    filterItem["tag_uid"] = true;
+    filterItem["label_weight"] = true;
+
+    DynamicJsonDocument doc(12288);
+    DeserializationError err = deserializeJson(doc, fallbackResp, DeserializationOption::Filter(filter));
+    if (err) {
+        errorOut = String("json parse failed: ") + err.c_str();
+        return false;
+    }
+
+    JsonArray spools = doc.as<JsonArray>();
+    for (JsonObject spool : spools) {
+        String spoolTagUid = getJsonStringValue(spool["tag_uid"]);
+        spoolTagUid.toUpperCase();
+        if (spoolTagUid == tagUidHex) {
+            spoolIdOut = String((int)spool["id"]);
+            labelWeightOut = spool["label_weight"] | 1000;
+            return true;
+        }
+    }
+
+    errorOut = "no spool with bambuddy tag_uid";
+    return false;
+}
+
+static String createBambuddySpool(
+    const IntegrationConfig& config,
+    const String& uid,
+    const TigerTagData& tagData,
+    float currentMeasuredWeight,
+    String& errorOut
+) {
+    errorOut = "";
+    TigerTagProductInfo productInfo;
+    String tigerErr;
+    bool hasProductInfo = fetchTigerTagProductInfo(uid, tagData.productId, productInfo, tigerErr);
+
+    String materialName = hasProductInfo && productInfo.material.length() ? productInfo.material : String("Material ") + String(tagData.materialId);
+    String brandName = hasProductInfo && productInfo.brand.length() ? productInfo.brand : "";
+    String aspect1Name = "";
+    if (!hasProductInfo || !brandName.length() || materialName.startsWith("Material ")) {
+        TigerTagResolvedMeta resolvedMeta;
+        String metaErr;
+        if (fetchTigerTagResolvedMeta(tagData, resolvedMeta, metaErr)) {
+            if (!brandName.length() && resolvedMeta.brandName.length()) brandName = resolvedMeta.brandName;
+            if (materialName.startsWith("Material ") && resolvedMeta.materialName.length()) materialName = resolvedMeta.materialName;
+            aspect1Name = resolvedMeta.aspect1Name;
+        }
+    }
+
+    String colorHex = hasProductInfo && productInfo.colorHex.length()
+        ? productInfo.colorHex
+        : colorToHex(tagData.colorR, tagData.colorG, tagData.colorB, tagData.colorA);
+    colorHex.toUpperCase();
+    String colorName;
+    appendUniqueColorName(colorName, nearestColorName(tagData.colorR, tagData.colorG, tagData.colorB));
+    if (hasMeaningfulRgb(tagData.color2R, tagData.color2G, tagData.color2B)) {
+        appendUniqueColorName(colorName, nearestColorName(tagData.color2R, tagData.color2G, tagData.color2B));
+    }
+    if (hasMeaningfulRgb(tagData.color3R, tagData.color3G, tagData.color3B)) {
+        appendUniqueColorName(colorName, nearestColorName(tagData.color3R, tagData.color3G, tagData.color3B));
+    }
+    int labelWeight = !isnan(productInfo.netWeightG) && productInfo.netWeightG > 0
+        ? (int)(productInfo.netWeightG + 0.5f)
+        : (tagData.weightValue > 0 ? (int)tagData.weightValue : 1000);
+    int remainingWeight = (int)(currentMeasuredWeight + (currentMeasuredWeight >= 0 ? 0.5f : -0.5f));
+    if (remainingWeight < 0) remainingWeight = 0;
+    int usedWeight = labelWeight - remainingWeight;
+    if (usedWeight < 0) usedWeight = 0;
+
+    DynamicJsonDocument payload(1536);
+    payload["material"] = materialName;
+    if (aspect1Name.length()) payload["subtype"] = aspect1Name;
+    if (colorName.length()) payload["color_name"] = colorName;
+    if (brandName.length()) payload["brand"] = brandName;
+    if (colorHex.length() == 8) payload["rgba"] = colorHex;
+    payload["label_weight"] = labelWeight;
+    payload["weight_used"] = usedWeight;
+    payload["weight_locked"] = true;
+    payload["tag_uid"] = buildTigerTagHexUid();
+    payload["data_origin"] = "tigertag";
+    if (hasProductInfo && productInfo.name.length()) {
+        payload["note"] = productInfo.name + " | TigerTag UID " + uid;
+    } else {
+        payload["note"] = "TigerTag UID " + uid;
+    }
+
+    String payloadStr;
+    serializeJson(payload, payloadStr);
+
+    HTTPClient http;
+    const String baseUrl = buildIntegrationApiBase(config);
+    const String url = baseUrl + "/inventory/spools";
+    deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
+    }
+    int code = http.POST(payloadStr);
+    String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = formatHttpFailure(code, resp);
+        return "";
+    }
+
+    DynamicJsonDocument responseDoc(4096);
+    DeserializationError createErr = deserializeJson(responseDoc, resp);
+    if (createErr) {
+        errorOut = String("json parse failed: ") + createErr.c_str();
+        return "";
+    }
+    return String((int)responseDoc["id"]);
+}
+
+static String createBambuddyPlaceholderSpool(
+    const IntegrationConfig& config,
+    const String& uid,
+    float currentMeasuredWeight,
+    String& errorOut
+) {
+    errorOut = "";
+
+    const String tagUidHex = buildTigerTagHexUid();
+    if (tagUidHex.length() == 0) {
+        errorOut = "missing tag hex uid";
+        return "";
+    }
+
+    int labelWeight = (int)(currentMeasuredWeight + (currentMeasuredWeight >= 0 ? 0.5f : -0.5f));
+    if (labelWeight <= 0) labelWeight = 1;
+
+    DynamicJsonDocument payload(512);
+    payload["material"] = "Unknown";
+    payload["label_weight"] = labelWeight;
+    payload["weight_used"] = 0;
+    payload["weight_locked"] = true;
+    payload["tag_uid"] = tagUidHex;
+    payload["data_origin"] = "tigertag";
+    payload["note"] = "TigerTag UID " + uid;
+
+    String payloadStr;
+    serializeJson(payload, payloadStr);
+
+    HTTPClient http;
+    const String baseUrl = buildIntegrationApiBase(config);
+    const String url = baseUrl + "/inventory/spools";
+    deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payloadStr.c_str());
+    if (!http.begin(url)) {
+        errorOut = "http begin failed";
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    if (!prepareIntegrationRequest(http, config, errorOut)) {
+        http.end();
+        return "";
+    }
+
+    int code = http.POST(payloadStr);
+    String resp = http.getString();
+    http.end();
+    if (code < 200 || code >= 300) {
+        errorOut = formatHttpFailure(code, resp);
+        return "";
+    }
+
+    DynamicJsonDocument responseDoc(2048);
+    DeserializationError createErr = deserializeJson(responseDoc, resp);
+    if (createErr) {
+        errorOut = String("json parse failed: ") + createErr.c_str();
+        return "";
+    }
+
+    String spoolId = String((int)responseDoc["id"]);
+    deviceLogf("[%s] Created placeholder spool %s for UID %s\n", config.name, spoolId.c_str(), uid.c_str());
     return spoolId;
 }
 
@@ -1261,12 +1661,21 @@ String findSpoolmanSpoolIdByUid(const IntegrationConfig& config, const String& u
         return "";
     }
 
+    if (isBambuddyIntegration(config)) {
+        String spoolId;
+        int labelWeight = 1000;
+        if (findBambuddySpoolByUid(config, uid, spoolId, labelWeight, errorOut)) {
+            return spoolId;
+        }
+        return "";
+    }
+
     if (isFilamanIntegration(config)) {
         String externalId = buildTigerTagExternalId(uid, lastTigerTagData);
         for (int page = 1; page <= 20; ++page) {
             HTTPClient http;
             const String url = baseUrl + "/spools?page=" + String(page) + "&page_size=200&include_archived=true";
-            Serial.printf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
+            deviceLogf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
             prepareSpoolmanHttp(http);
             if (!http.begin(url)) {
                 errorOut = "http begin failed";
@@ -1336,7 +1745,7 @@ String findSpoolmanSpoolIdByUid(const IntegrationConfig& config, const String& u
 
     HTTPClient http;
     const String url = baseUrl + "/spool";
-    Serial.printf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
+    deviceLogf("[%s] Lookup UID %s via %s\n", config.name, uid.c_str(), url.c_str());
     prepareSpoolmanHttp(http);
     if (!http.begin(url)) {
         errorOut = "http begin failed";
@@ -1399,6 +1808,55 @@ bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, fl
         return false;
     }
 
+    if (isBambuddyIntegration(config)) {
+        String spoolId;
+        int labelWeight = 1000;
+        if (!findBambuddySpoolByUid(config, uid, spoolId, labelWeight, errorOut)) {
+            if (errorOut != "no spool with bambuddy tag_uid") {
+                return false;
+            }
+            if (lastTigerTagData.valid) {
+                deviceLogf("[%s] No spool found for UID %s, creating one from TigerTag data\n", config.name, uid.c_str());
+                spoolId = createBambuddySpool(config, uid, lastTigerTagData, w, errorOut);
+                labelWeight = lastTigerTagData.weightValue > 0 ? (int)lastTigerTagData.weightValue : 1000;
+            } else {
+                deviceLogf("[%s] No spool found for UID %s, creating placeholder from UID/weight only\n", config.name, uid.c_str());
+                spoolId = createBambuddyPlaceholderSpool(config, uid, w, errorOut);
+                labelWeight = (int)(w + (w >= 0 ? 0.5f : -0.5f));
+                if (labelWeight <= 0) labelWeight = 1;
+            }
+            if (spoolId.length() == 0) return false;
+        }
+
+        int remainingWeight = (int)(w + (w >= 0 ? 0.5f : -0.5f));
+        if (remainingWeight < 0) remainingWeight = 0;
+        int usedWeight = labelWeight - remainingWeight;
+        if (usedWeight < 0) usedWeight = 0;
+
+        HTTPClient http;
+        const String url = baseUrl + "/inventory/spools/" + spoolId;
+        prepareSpoolmanHttp(http);
+        if (!http.begin(url)) {
+            errorOut = "http begin failed";
+            return false;
+        }
+        http.addHeader("Content-Type", "application/json");
+        if (!prepareIntegrationRequest(http, config, errorOut)) {
+            http.end();
+            return false;
+        }
+        String payload = String("{\"weight_used\":") + String(usedWeight) + ",\"weight_locked\":true}";
+        deviceLogf("[%s] PATCH %s payload=%s\n", config.name, url.c_str(), payload.c_str());
+        int code = http.PATCH(payload);
+        String resp = http.getString();
+        http.end();
+        if (code < 200 || code >= 300) {
+            errorOut = formatHttpFailure(code, resp);
+            return false;
+        }
+        return true;
+    }
+
     if (isFilamanIntegration(config)) {
         String externalId = buildTigerTagExternalId(uid, lastTigerTagData);
         auto postMeasurement = [&](String& measurementError) -> bool {
@@ -1419,7 +1877,7 @@ bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, fl
             String payload = String("{\"rfid_uid\":\"") + jsonEscape(uid) +
                 "\",\"external_id\":\"" + jsonEscape(externalId) +
                 "\",\"measured_weight_g\":" + String(clampedWeight) + "}";
-            Serial.printf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payload.c_str());
+            deviceLogf("[%s] POST %s payload=%s\n", config.name, url.c_str(), payload.c_str());
             int code = http.POST(payload);
             String resp = http.getString();
             http.end();
@@ -1459,7 +1917,7 @@ bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, fl
                 errorOut = "no spool with extra_rfid_uid and no TigerTag payload available";
                 return false;
             }
-            Serial.printf("[%s] No spool found for UID %s, creating one from TigerTag data\n", config.name, uid.c_str());
+            deviceLogf("[%s] No spool found for UID %s, creating one from TigerTag data\n", config.name, uid.c_str());
             resolvedSpoolId = createSpoolmanSpool(config, uid, lastTigerTagData, w, errorOut);
             if (resolvedSpoolId.length() == 0) return false;
         } else {
@@ -1484,7 +1942,7 @@ bool syncWeightToSpoolman(const IntegrationConfig& config, const String& uid, fl
     const int weightInt = (int)(w + (w >= 0 ? 0.5f : -0.5f));
     const int clampedWeight = weightInt < 0 ? 0 : weightInt;
     String payload = String("{\"remaining_weight\":") + String(clampedWeight) + "}";
-    Serial.printf("[%s] PATCH %s payload=%s\n", config.name, url.c_str(), payload.c_str());
+    deviceLogf("[%s] PATCH %s payload=%s\n", config.name, url.c_str(), payload.c_str());
     const int code = http.PATCH(payload);
     const String resp = http.getString();
     http.end();
@@ -2078,7 +2536,7 @@ void setupWebServer() {
             spoolmanConfig.password = String((const char*)(doc["password"] | ""));
             spoolmanConfig.password.trim();
             saveIntegrationConfig();
-            Serial.printf("[Spoolman] Config saved. enabled=%s url=%s token=%s\n",
+            deviceLogf("[Spoolman] Config saved. enabled=%s url=%s token=%s\n",
                 spoolmanConfig.enabled ? "true" : "false",
                 spoolmanConfig.url.c_str(),
                 spoolmanConfig.token.length() ? "<set>" : "<empty>");
@@ -2106,12 +2564,35 @@ void setupWebServer() {
             filamanConfig.password.trim();
             invalidateFilamanSession();
             saveIntegrationConfig();
-            Serial.printf("[Filaman] Config saved. enabled=%s url=%s token=%s username=%s password=%s\n",
+            deviceLogf("[Filaman] Config saved. enabled=%s url=%s token=%s username=%s password=%s\n",
                 filamanConfig.enabled ? "true" : "false",
                 filamanConfig.url.c_str(),
                 filamanConfig.token.length() ? "<set>" : "<empty>",
                 filamanConfig.username.length() ? "<set>" : "<empty>",
                 filamanConfig.password.length() ? "<set>" : "<empty>");
+
+            request->send(200, "application/json", "{\"success\":true}");
+        }
+    );
+
+    server.on("/api/bambuddy", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            StaticJsonDocument<1024> doc;
+            DeserializationError err = deserializeJson(doc, data, len);
+            if (err) {
+                request->send(400, "application/json", String("{\"success\":false,\"error\":\"") + err.c_str() + "\"}");
+                return;
+            }
+
+            bambuddyConfig.enabled = doc["enabled"] | false;
+            bambuddyConfig.url = normalizeSpoolmanBaseUrl(doc["url"] | "");
+            bambuddyConfig.token = String((const char*)(doc["token"] | ""));
+            bambuddyConfig.token.trim();
+            saveIntegrationConfig();
+            deviceLogf("[Bambuddy] Config saved. enabled=%s url=%s token=%s\n",
+                bambuddyConfig.enabled ? "true" : "false",
+                bambuddyConfig.url.c_str(),
+                bambuddyConfig.token.length() ? "<set>" : "<empty>");
 
             request->send(200, "application/json", "{\"success\":true}");
         }
@@ -2201,9 +2682,30 @@ void setupWebServer() {
         json += "\"filamanUrl\":\"" + jsonEscape(filamanConfig.url) + "\",";
         json += "\"filamanToken\":\"" + jsonEscape(filamanConfig.token) + "\",";
         json += "\"filamanUsername\":\"" + jsonEscape(filamanConfig.username) + "\",";
-        json += "\"filamanPassword\":\"" + jsonEscape(filamanConfig.password) + "\"";
+        json += "\"filamanPassword\":\"" + jsonEscape(filamanConfig.password) + "\",";
+        json += "\"bambuddyEnabled\":" + String(bambuddyConfig.enabled ? "true" : "false") + ",";
+        json += "\"bambuddyUrl\":\"" + jsonEscape(bambuddyConfig.url) + "\",";
+        json += "\"bambuddyToken\":\"" + jsonEscape(bambuddyConfig.token) + "\"";
         json += "}";
         request->send(200, "application/json", json);
+    });
+
+    server.on("/api/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(32768);
+        JsonArray lines = doc.createNestedArray("lines");
+        for (size_t i = 0; i < deviceLogCount; ++i) {
+            size_t idx = (deviceLogStart + i) % DEVICE_LOG_CAPACITY;
+            lines.add(deviceLogLines[idx]);
+        }
+        doc["count"] = (int)deviceLogCount;
+        String body;
+        serializeJson(doc, body);
+        request->send(200, "application/json", body);
+    });
+
+    server.on("/api/logs/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
+        clearDeviceLogs();
+        request->send(200, "application/json", "{\"success\":true}");
     });
 
     // REST: set/validate API key
@@ -2691,7 +3193,9 @@ float readWeight() {
     }
 
     // 1) Fast raw read (low latency)
-    float raw = scale.get_units(1);
+    // The installed load cell orientation is inverted relative to the logical
+    // "weight added to platform" direction, so normalize it here once.
+    float raw = -scale.get_units(1);
 
     // 2) Update small median window
     gMedianBuf[gMedianIdx] = raw;
@@ -2765,7 +3269,7 @@ String readRFID() {
     String tagReadError;
     if (readTigerTagData(tagData, tagReadError)) {
         lastTigerTagData = tagData;
-        Serial.printf("[TigerTag] Read payload: tigerTagId=%u productId=%u materialId=%u brandId=%u diameterId=%u weight=%u unit=%u\n",
+        deviceLogf("[TigerTag] Read payload: tigerTagId=%u productId=%u materialId=%u brandId=%u diameterId=%u weight=%u unit=%u\n",
             (unsigned)tagData.tigerTagId,
             (unsigned)tagData.productId,
             (unsigned)tagData.materialId,
@@ -2775,7 +3279,7 @@ String readRFID() {
             (unsigned)tagData.weightUnitId);
     } else {
         lastTigerTagData = TigerTagData();
-        Serial.printf("[TigerTag] Payload read failed for UID %s: %s\n", decStr.c_str(), tagReadError.c_str());
+        deviceLogf("[TigerTag] Payload read failed for UID %s: %s\n", decStr.c_str(), tagReadError.c_str());
     }
 
     rfid.PICC_HaltA();
@@ -2843,6 +3347,9 @@ void setup() {
     filamanConfig.token = prefs.getString("filamanToken", "");
     filamanConfig.username = prefs.getString("filamanUsername", "");
     filamanConfig.password = prefs.getString("filamanPassword", "");
+    bambuddyConfig.enabled = prefs.getBool("bambuddyEnabled", false);
+    bambuddyConfig.url = normalizeSpoolmanBaseUrl(prefs.getString("bambuddyUrl", ""));
+    bambuddyConfig.token = prefs.getString("bambuddyToken", "");
     prefs.end();
     
     setBootStage("03", "WiFi event hook");
@@ -2930,9 +3437,13 @@ void loop() {
         spoolmanSyncPending = hasEnabledIntegration();
         if (spoolmanSyncPending) {
             showSpoolmanStatus("Reading", "Please wait", 6000);
+        } else {
+            String shortUid = uid;
+            if (shortUid.length() > 8) shortUid = shortUid.substring(shortUid.length() - 8);
+            showSpoolmanStatus("Tag Read", shortUid, 1800);
         }
         displayWeight(currentWeight, lastUID);
-        Serial.println("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
+        deviceLogln("UID detected (DEC): " + lastUID + "  (HEX): " + lastUIDHex);
     }
     
     float weight = readWeight();
@@ -2945,18 +3456,18 @@ void loop() {
         String failedName;
         String failedError;
 
-        IntegrationConfig* integrations[] = {&spoolmanConfig, &filamanConfig};
+        IntegrationConfig* integrations[] = {&spoolmanConfig, &filamanConfig, &bambuddyConfig};
         for (IntegrationConfig* integration : integrations) {
             if (!integration->enabled) continue;
 
             String integrationError;
-            Serial.printf("[%s] Starting sync for UID %s at weight %.2f g\n", integration->name, lastUID.c_str(), weight);
+            deviceLogf("[%s] Starting sync for UID %s at weight %.2f g\n", integration->name, lastUID.c_str(), weight);
             const bool ok = syncWeightToSpoolman(*integration, lastUID, weight, integrationError);
             if (ok) {
-                Serial.printf("[%s] Sync success for UID %s\n", integration->name, lastUID.c_str());
+                deviceLogf("[%s] Sync success for UID %s\n", integration->name, lastUID.c_str());
             } else {
                 overallOk = false;
-                Serial.printf("[%s] Sync failed for UID %s: %s\n", integration->name, lastUID.c_str(), integrationError.c_str());
+                deviceLogf("[%s] Sync failed for UID %s: %s\n", integration->name, lastUID.c_str(), integrationError.c_str());
                 if (failedName.length() == 0) {
                     failedName = integration->name;
                     failedError = integrationError;
